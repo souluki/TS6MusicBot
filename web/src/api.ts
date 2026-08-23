@@ -117,7 +117,7 @@ export async function apiPutFile<T>(path: string, file: File, extraHeaders?: Rec
     path,
     {
       method: 'PUT',
-      headers: buildHeaders(extraHeaders, file.type || 'application/octet-stream'),
+      headers: buildHeaders({ 'X-File-Name': file.name, ...(extraHeaders || {}) }, file.type || 'application/octet-stream'),
       body: file,
     },
   )

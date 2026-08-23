@@ -8,6 +8,7 @@ service VoiceService {
   rpc Ping(Empty) returns (PingResponse);
 
   rpc Play(PlayRequest) returns (CommandResponse);
+  rpc PlayOverlay(PlayOverlayRequest) returns (CommandResponse);
   rpc Pause(Empty) returns (CommandResponse);
   rpc Resume(Empty) returns (CommandResponse);
   rpc Seek(SeekRequest) returns (CommandResponse);
@@ -17,6 +18,8 @@ service VoiceService {
   rpc SendNotice(NoticeRequest) returns (CommandResponse);
 
   rpc SetClientDescription(SetClientDescriptionRequest) returns (CommandResponse);
+  rpc SetClientNickname(SetClientNicknameRequest) returns (CommandResponse);
+  rpc SetClientAvatar(SetClientAvatarRequest) returns (CommandResponse);
 
   rpc SetVolume(SetVolumeRequest) returns (CommandResponse);
   rpc GetStatus(Empty) returns (StatusResponse);
@@ -36,6 +39,13 @@ message PlayRequest {
   string title = 2;
   string requested_by = 3;
   string notice = 4;
+}
+
+message PlayOverlayRequest {
+  string source_url = 1;
+  string title = 2;
+  string requested_by = 3;
+  float duck_db = 4;
 }
 
 message SeekRequest {
@@ -58,6 +68,14 @@ message NoticeRequest {
 
 message SetClientDescriptionRequest {
   string description = 1;
+}
+
+message SetClientNicknameRequest {
+  string nickname = 1;
+}
+
+message SetClientAvatarRequest {
+  string file_path = 1;
 }
 
 message StatusResponse {
@@ -100,6 +118,7 @@ message SubscribeRequest {
   bool include_chat = 1;
   bool include_playback = 2;
   bool include_log = 3;
+  bool include_user_joined = 4;
 }
 
 message Event {
@@ -109,7 +128,16 @@ message Event {
     ChatEvent chat = 2;
     PlaybackEvent playback = 3;
     LogEvent log = 4;
+    UserJoinedEvent user_joined = 5;
   }
+}
+
+message UserJoinedEvent {
+  uint64 channel_id = 1;
+  uint64 client_id = 2;
+  string unique_id = 3;
+  string name = 4;
+  uint64 bot_channel_id = 5;
 }
 
 message ChatEvent {

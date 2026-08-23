@@ -47,6 +47,18 @@ interface ManagedAsset {
   help: string
 }
 
+interface CustomVoice {
+  id: number
+  command: string
+  label: string
+  original_filename: string
+  media_type: string
+  size_bytes: number
+  created_at: string
+  is_welcome: boolean
+  enabled: boolean
+}
+
 const GROUPS = [
   ['web', 'Web 配置'],
   ['backend', 'Voice 服务'],
@@ -75,6 +87,10 @@ const loading = ref(true)
 const saving = ref(false)
 const applying = ref(false)
 const error = ref('')
+const customVoices = ref<CustomVoice[]>([])
+const customVoiceCommand = ref('')
+const customVoiceLabel = ref('')
+const customVoiceBusy = ref(false)
 const toastMessage = ref('')
 const toastType = ref<'success' | 'error' | 'info'>('info')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
@@ -96,16 +112,87 @@ function hydrate(result: SettingsPayload) {
   draft.value = next
 }
 
+async function loadCustomVoices() {
+  customVoices.value = (await apiGet<{ voices: CustomVoice[] }>('/admin/custom-voices')).voices || []
+}
+
 async function load() {
   loading.value = true
   error.value = ''
   try {
     hydrate(await apiGet<SettingsPayload>('/admin/settings'))
+    await loadCustomVoices()
   } catch (e: any) {
     error.value = String(e?.message || e)
     showToast(error.value, 'error', 8000)
   } finally {
     loading.value = false
+  }
+}
+
+async function uploadCustomVoice(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  const command = customVoiceCommand.value.trim()
+  if (!file || !command) {
+    showToast('请先填写指令并选择音频文件', 'error')
+    return
+  }
+  customVoiceBusy.value = true
+  try {
+    await apiPutFile(
+      `/admin/custom-voices/0?command=${encodeURIComponent(command)}&label=${encodeURIComponent(customVoiceLabel.value.trim())}`,
+      file,
+    )
+    customVoiceCommand.value = ''
+    customVoiceLabel.value = ''
+    await loadCustomVoices()
+    showToast('内置语音已上传并绑定', 'success')
+  } catch (e: any) {
+    showToast(String(e?.message || e), 'error', 8000)
+  } finally {
+    customVoiceBusy.value = false
+  }
+}
+
+async function deleteCustomVoice(voice: CustomVoice) {
+  if (!confirm(`确定删除内置语音“${voice.label}”吗？`)) return
+  customVoiceBusy.value = true
+  try {
+    await apiDelete(`/admin/custom-voices/${voice.id}`)
+    await loadCustomVoices()
+    showToast('内置语音已删除', 'success')
+  } catch (e: any) {
+    showToast(String(e?.message || e), 'error', 8000)
+  } finally {
+    customVoiceBusy.value = false
+  }
+}
+
+async function setWelcomeVoice(voice: CustomVoice | null) {
+  customVoiceBusy.value = true
+  try {
+    await apiPut(`/admin/custom-voices/${voice?.id || 0}/welcome`, {})
+    await loadCustomVoices()
+    showToast(voice ? `已将“${voice.label}”设为全局欢迎语音` : '已关闭全局欢迎语音', 'success')
+  } catch (e: any) {
+    showToast(String(e?.message || e), 'error', 8000)
+  } finally {
+    customVoiceBusy.value = false
+  }
+}
+
+async function setCustomVoiceEnabled(voice: CustomVoice) {
+  customVoiceBusy.value = true
+  try {
+    await apiPut(`/admin/custom-voices/${voice.id}/enabled?enabled=${!voice.enabled}`, {})
+    await loadCustomVoices()
+    showToast(voice.enabled ? '内置语音已停用' : '内置语音已启用', 'success')
+  } catch (e: any) {
+    showToast(String(e?.message || e), 'error', 8000)
+  } finally {
+    customVoiceBusy.value = false
   }
 }
 
@@ -343,6 +430,44 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+            </section>
+
+            <section v-if="activeGroup === 'teamspeak'" class="theme-settings-panel bg-white border border-gray-200 rounded-lg mb-6 p-4 md:p-5">
+              <div class="mb-4">
+                <h3 class="text-sm font-semibold text-gray-800">自定义内置语音</h3>
+                <p class="text-xs text-gray-500 mt-1">上传音频并绑定一个指令；普通用户可在 TS 文字频道直接输入该指令触发。播放音乐时默认降低背景音量 12 dB 并混音。</p>
+              </div>
+              <div class="grid md:grid-cols-[180px_minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 items-center">
+                <input v-model="customVoiceCommand" class="input-field" placeholder="指令，例如 鼓掌" />
+                <input v-model="customVoiceLabel" class="input-field" placeholder="显示名称（可选）" />
+                <label :class="['btn-secondary cursor-pointer justify-center', customVoiceBusy ? 'opacity-50 pointer-events-none' : '']">
+                  <Upload :size="17" />
+                  选择音频并上传
+                  <input type="file" class="sr-only" accept="audio/*,.mp3,.wav,.ogg,.flac,.m4a,.aac,.webm" :disabled="customVoiceBusy" @change="uploadCustomVoice" />
+                </label>
+                <span class="text-xs text-gray-400">最大 50 MiB</span>
+              </div>
+              <div v-if="customVoices.length" class="mt-4 divide-y divide-gray-100 border-t border-gray-100">
+                <div v-for="voice in customVoices" :key="voice.id" class="py-3 flex items-center gap-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="text-sm font-medium" :class="voice.enabled ? 'text-gray-800' : 'text-gray-400'">{{ voice.label }}</div>
+                    <div class="text-xs text-gray-500 mt-1">输入 <code class="font-mono">{{ voice.command }}</code> · {{ voice.original_filename }}</div>
+                  </div>
+                  <span class="text-xs" :class="voice.enabled ? 'text-green-600' : 'text-gray-400'">{{ voice.enabled ? '已启用' : '已停用' }}</span>
+                  <button type="button" class="btn-secondary text-xs" :disabled="customVoiceBusy" @click="setCustomVoiceEnabled(voice)">
+                    {{ voice.enabled ? '停用' : '启用' }}
+                  </button>
+                  <button type="button" class="btn-secondary text-xs" :disabled="customVoiceBusy" @click="setWelcomeVoice(voice)">
+                    {{ voice.is_welcome ? '当前欢迎语音' : '设为欢迎语音' }}
+                  </button>
+                  <button type="button" class="p-2 text-gray-500 hover:text-red-600" :disabled="customVoiceBusy" title="删除内置语音" @click="deleteCustomVoice(voice)">
+                    <Trash2 :size="18" />
+                  </button>
+                </div>
+              </div>
+              <div v-else class="mt-4 text-xs text-gray-400">尚未配置内置语音。</div>
+              <div v-if="customVoices.some((voice) => voice.is_welcome)" class="mt-3 text-xs text-green-700">已配置全局欢迎语音；目标频道由上方“欢迎语音目标频道 ID”控制。Bot 不在目标频道时会跳过，不会自动移动。</div>
+              <div v-else-if="customVoices.length" class="mt-3 text-xs text-gray-500">尚未选择全局欢迎语音。点击“设为欢迎语音”后，用户进入目标频道时播放。</div>
             </section>
 
             <section v-if="activeFields.length" class="theme-settings-panel bg-white border border-gray-200 rounded-lg divide-y divide-gray-100">

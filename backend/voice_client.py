@@ -75,6 +75,19 @@ class VoiceClient:
             self._pb2.PlayRequest(source_url=source_url, title=title, requested_by=requested_by, notice=notice)
         )
 
+    async def play_overlay(self, source_url: str, title: str, requested_by: str, duck_db: float = 12.0) -> bool:
+        stub = self._get_stub()
+        assert self._pb2 is not None
+        response = await stub.PlayOverlay(
+            self._pb2.PlayOverlayRequest(
+                source_url=source_url,
+                title=title,
+                requested_by=requested_by,
+                duck_db=float(duck_db),
+            )
+        )
+        return bool(getattr(response, "ok", False))
+
     async def pause(self) -> None:
         stub = self._get_stub()
         assert self._pb2 is not None
@@ -102,15 +115,28 @@ class VoiceClient:
         assert self._pb2 is not None
         await stub.Skip(self._pb2.Empty())
 
-    async def send_notice(self, message: str, *, target_mode: int = 2) -> None:
+    async def send_notice(self, message: str, *, target_mode: int = 2) -> bool:
         stub = self._get_stub()
         assert self._pb2 is not None
-        await stub.SendNotice(self._pb2.NoticeRequest(message=message, target_mode=int(target_mode)))
+        response = await stub.SendNotice(self._pb2.NoticeRequest(message=message, target_mode=int(target_mode)))
+        return bool(getattr(response, "ok", False))
 
     async def set_client_description(self, description: str) -> None:
         stub = self._get_stub()
         assert self._pb2 is not None
         await stub.SetClientDescription(self._pb2.SetClientDescriptionRequest(description=description))
+
+    async def set_client_nickname(self, nickname: str) -> bool:
+        stub = self._get_stub()
+        assert self._pb2 is not None
+        response = await stub.SetClientNickname(self._pb2.SetClientNicknameRequest(nickname=nickname))
+        return bool(getattr(response, "ok", False))
+
+    async def set_client_avatar(self, file_path: str) -> bool:
+        stub = self._get_stub()
+        assert self._pb2 is not None
+        response = await stub.SetClientAvatar(self._pb2.SetClientAvatarRequest(file_path=file_path))
+        return bool(getattr(response, "ok", False))
 
     async def set_volume(self, volume_percent: int) -> None:
         stub = self._get_stub()
@@ -171,6 +197,7 @@ class VoiceClient:
         include_chat: bool = True,
         include_playback: bool = False,
         include_log: bool = False,
+        include_user_joined: bool = False,
     ) -> AsyncIterator[object]:
         stub = self._get_stub()
         assert self._pb2 is not None
@@ -178,6 +205,7 @@ class VoiceClient:
             include_chat=include_chat,
             include_playback=include_playback,
             include_log=include_log,
+            include_user_joined=include_user_joined,
         )
         async for ev in stub.SubscribeEvents(req):
             yield ev

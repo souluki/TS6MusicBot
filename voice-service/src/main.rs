@@ -14,7 +14,8 @@ use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{BroadcastStream, TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -22,7 +23,7 @@ use tracing::{error, info, warn};
 
 mod logger;
 
-use tsclientlib::{Connection, DisconnectOptions, Identity, StreamItem, Version};
+use tsclientlib::{Connection, DisconnectOptions, Identity, OutCommandExt, StreamItem, Version};
 use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio, OutCommand, OutPacket, PacketType};
 use tsclientlib::{events, MessageTarget};
 use tsclientlib::ChannelId;
@@ -166,10 +167,34 @@ struct PlaybackControl {
     handle: tokio::task::JoinHandle<()>,
 }
 
+struct OverlayControl {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+    queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    active: Arc<AtomicBool>,
+    duck_db: f32,
+}
+
 struct AvatarUploadState {
     handle: tsclientlib::FiletransferHandle,
     local_path: PathBuf,
     md5_hex: String,
+}
+
+struct AvatarCommandState {
+    handle: tsclientlib::MessageHandle,
+    md5_hex: String,
+}
+
+struct NicknameUpdateRequest {
+    nickname: String,
+    command: OutCommand,
+    result_tx: oneshot::Sender<std::result::Result<(), String>>,
+}
+
+struct NicknameUpdateState {
+    nickname: String,
+    result_tx: oneshot::Sender<std::result::Result<(), String>>,
 }
 
 fn pick_avatar_file(dir: &Path) -> Option<PathBuf> {
@@ -240,9 +265,12 @@ impl Drop for ChildKillOnDrop {
 struct VoiceServiceImpl {
     status: Arc<Mutex<SharedStatus>>,
     playback: Arc<Mutex<Option<PlaybackControl>>>,
+    overlay: Arc<Mutex<Option<OverlayControl>>>,
     ts3_audio_tx: mpsc::Sender<OutPacket>,
     ts3_notice_tx: mpsc::Sender<(i32, String)>,
     ts3_cmd_tx: mpsc::Sender<OutCommand>,
+    ts3_nickname_tx: mpsc::Sender<NicknameUpdateRequest>,
+    ts3_avatar_tx: mpsc::Sender<PathBuf>,
     events_tx: broadcast::Sender<voicev1::Event>,
     persist_tx: mpsc::Sender<PersistedVoiceState>,
 }
@@ -265,11 +293,17 @@ fn now_unix_ms() -> i64 {
 }
 
 fn emit_log(events_tx: &broadcast::Sender<voicev1::Event>, level: i32, msg: impl Into<String>) {
+    let msg = msg.into();
+    match level {
+        4 => error!("{msg}"),
+        3 => warn!("{msg}"),
+        _ => info!("{msg}"),
+    }
     let _ = events_tx.send(voicev1::Event {
         unix_ms: now_unix_ms(),
         payload: Some(voicev1::event::Payload::Log(voicev1::LogEvent {
             level,
-            message: msg.into(),
+            message: msg,
         })),
     });
 }
@@ -290,6 +324,23 @@ fn emit_playback(
             detail: detail.into(),
         })),
     });
+}
+
+fn normalize_notice_target_mode(requested_mode: i32) -> i32 {
+    if requested_mode == 3 { 3 } else { 2 }
+}
+
+fn build_notice_command(target_mode: i32, message: &str) -> OutCommand {
+    let mode = normalize_notice_target_mode(target_mode);
+    let mut cmd = OutCommand::new(
+        Direction::C2S,
+        Flags::empty(),
+        PacketType::Command,
+        "sendtextmessage",
+    );
+    cmd.write_arg("targetmode", &mode);
+    cmd.write_arg("msg", &message);
+    cmd
 }
 
 #[tonic::async_trait]
@@ -314,6 +365,24 @@ impl VoiceService for VoiceServiceImpl {
         Ok(Response::new(voicev1::CommandResponse {
             ok: true,
             message: "accepted".to_string(),
+        }))
+    }
+
+    async fn play_overlay(
+        &self,
+        req: Request<voicev1::PlayOverlayRequest>,
+    ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
+        let r = req.into_inner();
+        if self.playback.lock().await.is_none() {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "no active playback".to_string(),
+            }));
+        }
+        self.start_overlay_internal(r.source_url, r.duck_db).await?;
+        Ok(Response::new(voicev1::CommandResponse {
+            ok: true,
+            message: "overlay accepted".to_string(),
         }))
     }
 
@@ -421,6 +490,72 @@ impl VoiceService for VoiceServiceImpl {
         }))
     }
 
+    async fn set_client_nickname(
+        &self,
+        req: Request<voicev1::SetClientNicknameRequest>,
+    ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
+        let nickname = req.into_inner().nickname.trim().replace(['\r', '\n', '\t'], " ");
+        if nickname.is_empty() || nickname.chars().count() > 64 {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "nickname must contain 1-64 characters".to_string(),
+            }));
+        }
+        let encoded = ts3_escape_value(&nickname);
+        let mut cmd = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "clientupdate");
+        cmd.write_arg("client_nickname", &encoded);
+        let (result_tx, result_rx) = oneshot::channel();
+        self.ts3_nickname_tx
+            .send(NicknameUpdateRequest {
+                nickname,
+                command: cmd,
+                result_tx,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("send failed: {e}")))?;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
+        match result {
+            Ok(Ok(Ok(()))) => Ok(Response::new(voicev1::CommandResponse {
+                ok: true,
+                message: "ok".to_string(),
+            })),
+            Ok(Ok(Err(message))) => Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message,
+            })),
+            Ok(Err(_)) => Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "nickname update actor stopped".to_string(),
+            })),
+            Err(_) => Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "nickname update timed out".to_string(),
+            })),
+        }
+    }
+
+    async fn set_client_avatar(
+        &self,
+        req: Request<voicev1::SetClientAvatarRequest>,
+    ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
+        let path = resolve_repo_relative(req.into_inner().file_path.trim());
+        if !path.is_file() {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "avatar file does not exist".to_string(),
+            }));
+        }
+        self.ts3_avatar_tx
+            .send(path)
+            .await
+            .map_err(|e| Status::internal(format!("send failed: {e}")))?;
+        Ok(Response::new(voicev1::CommandResponse {
+            ok: true,
+            message: "queued".to_string(),
+        }))
+    }
+
     async fn resume(
         &self,
         _req: Request<voicev1::Empty>,
@@ -480,6 +615,7 @@ impl VoiceService for VoiceServiceImpl {
         _req: Request<voicev1::Empty>,
     ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
         self.stop_internal().await;
+        self.stop_overlay_internal().await;
 
         {
             let mut st = self.status.lock().await;
@@ -509,13 +645,14 @@ impl VoiceService for VoiceServiceImpl {
         req: Request<voicev1::NoticeRequest>,
     ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
         let r = req.into_inner();
+        let mut accepted = true;
         if !r.message.is_empty() {
-            let mode = if r.target_mode == 3 { 3 } else { 2 };
-            let _ = self.ts3_notice_tx.try_send((mode, r.message));
+            let mode = normalize_notice_target_mode(r.target_mode);
+            accepted = self.ts3_notice_tx.try_send((mode, r.message)).is_ok();
         }
         Ok(Response::new(voicev1::CommandResponse {
-            ok: true,
-            message: "ok".to_string(),
+            ok: accepted,
+            message: if accepted { "ok" } else { "notice queue full" }.to_string(),
         }))
     }
 
@@ -610,6 +747,7 @@ impl VoiceService for VoiceServiceImpl {
             let include_chat = cfg.include_chat;
             let include_playback = cfg.include_playback;
             let include_log = cfg.include_log;
+            let include_user_joined = cfg.include_user_joined;
             async move {
                 match r {
                     Ok(ev) => {
@@ -617,6 +755,7 @@ impl VoiceService for VoiceServiceImpl {
                             Some(voicev1::event::Payload::Chat(_)) => include_chat,
                             Some(voicev1::event::Payload::Playback(_)) => include_playback,
                             Some(voicev1::event::Payload::Log(_)) => include_log,
+                            Some(voicev1::event::Payload::UserJoined(_)) => include_user_joined,
                             None => false,
                         };
                         if ok { Some(Ok(ev)) } else { None }
@@ -661,6 +800,7 @@ impl VoiceServiceImpl {
         }
 
         self.stop_internal().await;
+        self.stop_overlay_internal().await;
 
         {
             let mut st = self.status.lock().await;
@@ -668,9 +808,6 @@ impl VoiceServiceImpl {
             st.now_playing_source_url = source_url.clone();
             st.state = if paused { 3 } else { 2 };
         }
-
-        // PlaybackEvent.Type: STARTED=1
-        emit_playback(&self.events_tx, 1, title.clone(), source_url.clone(), "");
 
         let (paused_tx, paused_rx) = watch::channel(paused);
         let cancel = CancellationToken::new();
@@ -681,6 +818,9 @@ impl VoiceServiceImpl {
         let title_for_event = title.clone();
         let source_url_for_loop = source_url.clone();
         let cancel_for_task = cancel.clone();
+        let overlay = self.overlay.clone();
+        let loop_events_tx = events_tx.clone();
+        let loop_title = title_for_event.clone();
 
         let handle = tokio::spawn(async move {
             let r = playback_loop(
@@ -690,6 +830,9 @@ impl VoiceServiceImpl {
                 paused_rx,
                 cancel_for_task.clone(),
                 status,
+                overlay,
+                loop_events_tx,
+                loop_title,
             )
             .await;
             let was_cancelled = cancel_for_task.is_cancelled();
@@ -718,6 +861,96 @@ impl VoiceServiceImpl {
             handle,
         });
         Ok(())
+    }
+
+    async fn start_overlay_internal(&self, source_url: String, duck_db: f32) -> std::result::Result<(), Status> {
+        self.stop_overlay_internal().await;
+
+        let frame_bytes = (48000 / 50) * 2 * 2;
+        let queue = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+        let active = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_queue = queue.clone();
+        let task_active = active.clone();
+        let task_source = source_url.clone();
+
+        let handle = tokio::spawn(async move {
+            let is_network_input = source_url.starts_with("http://") || source_url.starts_with("https://");
+            let mut command = tokio::process::Command::new(ffmpeg_program());
+            command.arg("-nostdin").arg("-loglevel").arg("error");
+            if is_network_input {
+                command
+                    .arg("-reconnect")
+                    .arg("1")
+                    .arg("-reconnect_streamed")
+                    .arg("1")
+                    .arg("-reconnect_delay_max")
+                    .arg("5")
+                    .arg("-rw_timeout")
+                    .arg("15000000");
+            }
+            let child = command
+                .arg("-i")
+                .arg(&source_url)
+                .arg("-f")
+                .arg("s16le")
+                .arg("-ar")
+                .arg("48000")
+                .arg("-ac")
+                .arg("2")
+                .arg("pipe:1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let Ok(child) = child else {
+                warn!(source_url = %task_source, "failed to start overlay ffmpeg");
+                task_active.store(false, Ordering::Relaxed);
+                return;
+            };
+            let mut child = ChildKillOnDrop::new(child);
+            let Some(mut stdout) = child.child_mut().stdout.take() else {
+                task_active.store(false, Ordering::Relaxed);
+                return;
+            };
+            let mut buf = vec![0u8; frame_bytes];
+            loop {
+                if task_cancel.is_cancelled() {
+                    break;
+                }
+                if stdout.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                let mut buffered = task_queue.lock().await;
+                if buffered.len() >= 50 {
+                    buffered.pop_front();
+                }
+                buffered.push_back(buf.clone());
+            }
+            task_active.store(false, Ordering::Relaxed);
+        });
+
+        let mut slot = self.overlay.lock().await;
+        *slot = Some(OverlayControl {
+            cancel,
+            handle,
+            queue,
+            active,
+            duck_db: if duck_db.is_finite() { duck_db.clamp(0.0, 30.0) } else { 12.0 },
+        });
+        Ok(())
+    }
+
+    async fn stop_overlay_internal(&self) {
+        let mut slot = self.overlay.lock().await;
+        if let Some(control) = slot.take() {
+            control.cancel.cancel();
+            let abort_handle = control.handle.abort_handle();
+            let join = control.handle;
+            if tokio::time::timeout(Duration::from_secs(2), join).await.is_err() {
+                abort_handle.abort();
+            }
+        }
     }
 
     async fn stop_internal(&self) {
@@ -1006,6 +1239,8 @@ async fn ts3_actor(
     mut audio_rx: mpsc::Receiver<OutPacket>,
     mut notice_rx: mpsc::Receiver<(i32, String)>,
     mut cmd_rx: mpsc::Receiver<OutCommand>,
+    mut nickname_rx: mpsc::Receiver<NicknameUpdateRequest>,
+    mut avatar_rx: mpsc::Receiver<PathBuf>,
     events_tx: broadcast::Sender<voicev1::Event>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
@@ -1088,7 +1323,9 @@ async fn ts3_actor(
     }
 
     let mut out_buf: VecDeque<OutPacket> = VecDeque::with_capacity(400);
+    let mut pending_notices: VecDeque<(i32, String)> = VecDeque::new();
     let mut avatar_set_done = false;
+    let mut avatar_requests: VecDeque<PathBuf> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
 
@@ -1137,8 +1374,23 @@ async fn ts3_actor(
         };
 
         let mut logged_connected = false;
+        // `Connection::events()` may still be in its initial async connect
+        // future.  Do not call `disconnect()` or poll that stream again after
+        // an initial connection failure; tsclientlib 0.2.0 panics when its
+        // completed connect future is resumed.
+        let mut connection_ready = false;
         let mut last_muted_warn = Instant::now() - Duration::from_secs(60);
         let mut avatar_upload: Option<AvatarUploadState> = None;
+        let mut avatar_command: Option<AvatarCommandState> = None;
+        let mut notice_inflight: Option<(tsclientlib::MessageHandle, String)> = None;
+        // Client profile updates must wait for TeamSpeak's command result. Sending
+        // clientupdate as a raw packet made the RPC look successful even when TS
+        // rejected the nickname change (for example because of flood control).
+        let mut pending_client_updates: VecDeque<OutCommand> = VecDeque::new();
+        let mut client_update_inflight: Option<tsclientlib::MessageHandle> = None;
+        let mut pending_nickname_updates: VecDeque<NicknameUpdateRequest> = VecDeque::new();
+        let mut nickname_inflight: Option<(tsclientlib::MessageHandle, NicknameUpdateState)> = None;
+        let mut last_notice_sent = Instant::now() - Duration::from_secs(60);
         let mut conn_err: Option<String> = None;
 
         let mut send_last_tick = Instant::now();
@@ -1152,22 +1404,112 @@ async fn ts3_actor(
         let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(20));
 
         'inner: loop {
+            if nickname_inflight.is_none() {
+                if let Some(request) = pending_nickname_updates.pop_front() {
+                    let NicknameUpdateRequest {
+                        nickname,
+                        command,
+                        result_tx,
+                    } = request;
+                    match command.send_with_result(&mut con) {
+                        Ok(handle) => {
+                            emit_log(
+                                &events_tx,
+                                2,
+                                format!("client nickname update sent: {nickname}"),
+                            );
+                            nickname_inflight = Some((
+                                handle,
+                                NicknameUpdateState { nickname, result_tx },
+                            ));
+                        }
+                        Err(e) => {
+                            let message = format!("nickname update send failed: {e}");
+                            emit_log(&events_tx, 3, message.clone());
+                            let _ = result_tx.send(Err(message));
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if client_update_inflight.is_none() {
+                if let Some(cmd) = pending_client_updates.pop_front() {
+                    match cmd.send_with_result(&mut con) {
+                        Ok(handle) => {
+                            client_update_inflight = Some(handle);
+                            emit_log(&events_tx, 2, "client profile update command sent");
+                        }
+                        Err(e) => {
+                            emit_log(&events_tx, 3, format!("client profile update send failed: {e}"));
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if notice_inflight.is_none()
+                && last_notice_sent.elapsed() >= Duration::from_millis(100)
+            {
+                if let Some((mode, text)) = pending_notices.front().cloned() {
+                    let cmd = build_notice_command(mode, &text);
+                    match cmd.send_with_result(&mut con) {
+                        Ok(handle) => {
+                            notice_inflight = Some((handle, text));
+                            last_notice_sent = Instant::now();
+                        }
+                        Err(e) => {
+                            emit_log(&events_tx, 3, format!("sendtextmessage send failed: {e}"));
+                            pending_notices.pop_front();
+                        }
+                    }
+                    continue;
+                }
+            }
+
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
-                    if let Err(e) = con.disconnect(DisconnectOptions::new()) {
-                        emit_log(&events_tx, 3, format!("ts3 disconnect failed: {e}"));
+                    if connection_ready {
+                        if let Err(e) = con.disconnect(DisconnectOptions::new()) {
+                            emit_log(&events_tx, 3, format!("ts3 disconnect failed: {e}"));
+                        }
                     }
-                    let drain = async {
-                        con.events()
-                            .for_each(|_| futures::future::ready(()))
-                            .await;
-                    };
-                    let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
+                    if connection_ready {
+                        let drain = async {
+                            con.events()
+                                .for_each(|_| futures::future::ready(()))
+                                .await;
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
+                    }
                     conn_err = None;
                     break 'inner;
                 }
 
                 _ = event_tick.tick() => {
+                    while let Ok(path) = avatar_rx.try_recv() {
+                        avatar_requests.push_back(path);
+                    }
+                    if avatar_set_done && avatar_upload.is_none() && avatar_command.is_none() {
+                        if let Some(path) = avatar_requests.pop_front() {
+                            match fs::metadata(&path) {
+                                Ok(md) => match md5_hex_of_file(&path) {
+                                    Ok(md5_hex) => {
+                                        let remote_path = format!("/avatar_{}", md5_hex);
+                                        match con.upload_file(ChannelId(0), &remote_path, None, md.len(), true, false) {
+                                            Ok(h) => {
+                                                avatar_upload = Some(AvatarUploadState { handle: h, local_path: path.clone(), md5_hex: md5_hex.clone() });
+                                                emit_log(&events_tx, 2, format!("dynamic avatar upload started: {}", path.display()));
+                                            }
+                                            Err(e) => emit_log(&events_tx, 3, format!("dynamic avatar upload start failed: {e}")),
+                                        }
+                                    }
+                                    Err(e) => emit_log(&events_tx, 3, format!("dynamic avatar md5 failed: {e}")),
+                                },
+                                Err(e) => emit_log(&events_tx, 3, format!("dynamic avatar stat failed: {e}")),
+                            }
+                        }
+                    }
                     loop {
                         let next_item = {
                             let mut evs = con.events();
@@ -1176,6 +1518,7 @@ async fn ts3_actor(
 
                         match next_item {
                             Some(Some(Ok(StreamItem::BookEvents(evts)))) => {
+                                connection_ready = true;
                                 if !logged_connected {
                                     logged_connected = true;
                                     emit_log(&events_tx, 2, "ts3 connected");
@@ -1221,12 +1564,49 @@ async fn ts3_actor(
                                             } else {
                                                 emit_log(&events_tx, 3, format!("avatar path not found: {}", path.display()));
                                             }
+                                        } else {
+                                            avatar_set_done = true;
                                         }
                                     }
                                 }
 
                                 for e in evts {
-                                    if let events::Event::Message { target, invoker, message } = e {
+                                    match e {
+                                        events::Event::PropertyAdded {
+                                            id: events::PropertyId::Client(client_id),
+                                            extra,
+                                            ..
+                                        } if extra.reason.is_some() => {
+                                            if let Ok(st) = con.get_state() {
+                                                if client_id != st.own_client {
+                                                    if let Some(client) = st.clients.get(&client_id) {
+                                                    let uid = client
+                                                        .uid
+                                                        .as_ref()
+                                                        .map(|u| u.as_ref().to_string())
+                                                        .unwrap_or_default();
+                                                    let bot_channel_id = st
+                                                        .clients
+                                                        .get(&st.own_client)
+                                                        .map(|bot| bot.channel.0)
+                                                        .unwrap_or(0);
+                                                    let _ = events_tx.send(voicev1::Event {
+                                                        unix_ms: now_unix_ms(),
+                                                        payload: Some(voicev1::event::Payload::UserJoined(
+                                                            voicev1::UserJoinedEvent {
+                                                                channel_id: client.channel.0,
+                                                                client_id: client.id.0 as u64,
+                                                                unique_id: uid,
+                                                                name: client.name.clone(),
+                                                                bot_channel_id,
+                                                            },
+                                                        )),
+                                                    });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        events::Event::Message { target, invoker, message } => {
                                         let mode = match target {
                                             MessageTarget::Client(_) | MessageTarget::Poke(_) => 1,
                                             MessageTarget::Channel => 2,
@@ -1266,6 +1646,8 @@ async fn ts3_actor(
                                                 invoker_description: description,
                                             })),
                                         });
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -1292,16 +1674,15 @@ async fn ts3_actor(
                                                     "clientupdate",
                                                 );
                                                 cmd.write_arg("client_flag_avatar", &md5_hex);
-                                                if let Ok(client) = con.get_tsproto_client_mut() {
-                                                    if let Err(e) = client.send_packet(cmd.into_packet()) {
-                                                        emit_log(&events_tx, 3, format!("set avatar flag failed: {e}"));
-                                                        avatar_upload = None;
-                                                        continue;
+                                                match cmd.send_with_result(&mut con) {
+                                                    Ok(handle) => {
+                                                        avatar_command = Some(AvatarCommandState { handle, md5_hex: md5_hex.clone() });
+                                                        emit_log(&events_tx, 2, format!("avatar flag command sent: {}", md5_hex));
+                                                    }
+                                                    Err(e) => {
+                                                        emit_log(&events_tx, 3, format!("set avatar flag send failed: {e}"));
                                                     }
                                                 }
-
-                                                emit_log(&events_tx, 2, format!("avatar updated: {}", md5_hex));
-                                                avatar_set_done = true;
                                                 avatar_upload = None;
                                             }
                                             Err(e) => {
@@ -1322,6 +1703,95 @@ async fn ts3_actor(
                                 }
                             }
 
+                            Some(Some(Ok(StreamItem::MessageResult(handle, result)))) => {
+                                if let Some(st) = avatar_command.as_ref() {
+                                    if st.handle.0 == handle.0 {
+                                        let md5_hex = st.md5_hex.clone();
+                                        match &result {
+                                            Ok(()) => {
+                                                emit_log(&events_tx, 2, format!("avatar updated: {md5_hex}"));
+                                                avatar_set_done = true;
+                                            }
+                                            Err(e) => {
+                                                avatar_set_done = true;
+                                                emit_log(&events_tx, 3, format!("set avatar flag rejected: {e}"));
+                                            }
+                                        }
+                                        avatar_command = None;
+                                    }
+                                }
+                                if let Some(profile_handle) = client_update_inflight.as_ref() {
+                                    if profile_handle.0 == handle.0 {
+                                        match &result {
+                                            Ok(()) => emit_log(&events_tx, 2, "client profile update accepted"),
+                                            Err(e) => emit_log(&events_tx, 3, format!("client profile update rejected: {e}")),
+                                        }
+                                        client_update_inflight = None;
+                                    }
+                                }
+                                let nickname_matches = nickname_inflight
+                                    .as_ref()
+                                    .map(|(nickname_handle, _)| nickname_handle.0 == handle.0)
+                                    .unwrap_or(false);
+                                if nickname_matches {
+                                    let (_, request) = nickname_inflight
+                                        .take()
+                                        .expect("nickname handle checked above");
+                                    match &result {
+                                        Ok(()) => {
+                                            emit_log(
+                                                &events_tx,
+                                                2,
+                                                format!("client nickname update accepted: {}", request.nickname),
+                                            );
+                                            let _ = request.result_tx.send(Ok(()));
+                                        }
+                                        Err(e) => {
+                                            let message = format!("nickname update rejected: {e}");
+                                            emit_log(&events_tx, 3, message.clone());
+                                            let _ = request.result_tx.send(Err(message));
+                                        }
+                                    }
+                                }
+                                if let Some((notice_handle, text)) = notice_inflight.as_ref() {
+                                    if notice_handle.0 == handle.0 {
+                                        let text = text.clone();
+                                        pending_notices.pop_front();
+                                        match &result {
+                                            Ok(()) => emit_log(&events_tx, 2, format!("sendtextmessage delivered: {text}")),
+                                            Err(e) => emit_log(&events_tx, 3, format!("sendtextmessage rejected: {e}")),
+                                        }
+                                        notice_inflight = None;
+                                    }
+                                }
+                            }
+
+                            Some(Some(Ok(StreamItem::DisconnectedTemporarily(reason)))) => {
+                                connection_ready = false;
+                                logged_connected = false;
+                                avatar_set_done = false;
+                                avatar_upload = None;
+                                avatar_command = None;
+                                client_update_inflight = None;
+                                pending_client_updates.clear();
+                                if let Some((_, request)) = nickname_inflight.take() {
+                                    let _ = request
+                                        .result_tx
+                                        .send(Err("ts3 temporarily disconnected".to_string()));
+                                }
+                                for request in pending_nickname_updates.drain(..) {
+                                    let _ = request
+                                        .result_tx
+                                        .send(Err("ts3 temporarily disconnected".to_string()));
+                                }
+                                notice_inflight = None;
+                                emit_log(
+                                    &events_tx,
+                                    3,
+                                    format!("ts3 temporarily disconnected: {reason:?}"),
+                                );
+                            }
+
                             Some(Some(Ok(item))) => {
                                 let mut s = format!("{item:?}");
                                 let lower = s.to_ascii_lowercase();
@@ -1339,11 +1809,13 @@ async fn ts3_actor(
                             Some(Some(Err(e))) => {
                                 emit_log(&events_tx, 4, format!("ts3 error: {e}"));
                                 conn_err = Some(format!("ts3 event error: {e}"));
+                                connection_ready = false;
                                 break;
                             }
                             Some(None) => {
                                 emit_log(&events_tx, 4, "ts3 disconnected");
                                 conn_err = Some("ts3 disconnected".to_string());
+                                connection_ready = false;
                                 break;
                             }
                             None => break,
@@ -1385,6 +1857,7 @@ async fn ts3_actor(
                                 format!("send_audio failed (errs={}): {e}", send_audio_errs),
                             );
                             conn_err = Some(format!("send_audio failed: {e}"));
+                            connection_ready = false;
                             break 'inner;
                         }
                     }
@@ -1405,16 +1878,7 @@ async fn ts3_actor(
 
                 msg = notice_rx.recv() => {
                     if let Some((mode, text)) = msg {
-                        let target_mode = if mode == 3 { 3 } else { 2 };
-                        let mut cmd = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "sendtextmessage");
-                        cmd.write_arg("targetmode", &target_mode);
-                        cmd.write_arg("msg", &text);
-                        if let Ok(client) = con.get_tsproto_client_mut() {
-                            if let Err(e) = client.send_packet(cmd.into_packet()) {
-                                conn_err = Some(format!("sendtextmessage failed: {e}"));
-                                break 'inner;
-                            }
-                        }
+                        pending_notices.push_back((mode, text));
                     } else {
                         break 'outer;
                     }
@@ -1422,12 +1886,15 @@ async fn ts3_actor(
 
                 cmd = cmd_rx.recv() => {
                     if let Some(c) = cmd {
-                        if let Ok(client) = con.get_tsproto_client_mut() {
-                            if let Err(e) = client.send_packet(c.into_packet()) {
-                                conn_err = Some(format!("send_packet failed: {e}"));
-                                break 'inner;
-                            }
-                        }
+                        pending_client_updates.push_back(c);
+                    } else {
+                        break 'outer;
+                    }
+                }
+
+                request = nickname_rx.recv() => {
+                    if let Some(request) = request {
+                        pending_nickname_updates.push_back(request);
                     } else {
                         break 'outer;
                     }
@@ -1455,14 +1922,16 @@ async fn ts3_actor(
             );
         }
 
-        if let Err(e) = con.disconnect(DisconnectOptions::new()) {
-            emit_log(&events_tx, 3, format!("ts3 disconnect failed: {e}"));
-        }
+        if connection_ready {
+            if let Err(e) = con.disconnect(DisconnectOptions::new()) {
+                emit_log(&events_tx, 3, format!("ts3 disconnect failed: {e}"));
+            }
 
-        let drain = async {
-            con.events().for_each(|_| futures::future::ready(())).await;
-        };
-        let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+            let drain = async {
+                con.events().for_each(|_| futures::future::ready(())).await;
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+        }
 
         if shutdown_token.is_cancelled() {
             break;
@@ -1489,6 +1958,34 @@ async fn ts3_actor(
     Ok(())
 }
 
+fn ffmpeg_program() -> String {
+    get_env("TSBOT_FFMPEG", "ffmpeg")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_notice_command, normalize_notice_target_mode};
+
+    #[test]
+    fn channel_notice_mode_is_two() {
+        assert_eq!(2, normalize_notice_target_mode(2));
+        assert_eq!(2, normalize_notice_target_mode(0));
+        assert_eq!(2, normalize_notice_target_mode(1));
+    }
+
+    #[test]
+    fn server_notice_mode_is_preserved() {
+        assert_eq!(3, normalize_notice_target_mode(3));
+    }
+
+    #[test]
+    fn current_channel_notice_command_contains_target_mode_two() {
+        let content = build_notice_command(2, "♪ 主歌词").into_packet().content().to_vec();
+        let content = String::from_utf8(content).expect("TeamSpeak command is UTF-8");
+        assert_eq!("sendtextmessage targetmode=2 msg=♪\\s主歌词", content);
+    }
+}
+
 async fn playback_loop(
     source_url: String,
     start_time_s: f64,
@@ -1496,6 +1993,9 @@ async fn playback_loop(
     mut paused_rx: watch::Receiver<bool>,
     cancel: CancellationToken,
     status: Arc<Mutex<SharedStatus>>,
+    overlay: Arc<Mutex<Option<OverlayControl>>>,
+    events_tx: broadcast::Sender<voicev1::Event>,
+    title: String,
 ) -> Result<()> {
     let playback_started = Instant::now();
     let start_time_s = if start_time_s.is_finite() {
@@ -1506,7 +2006,7 @@ async fn playback_loop(
     info!(source_url = %source_url, start_time_s = %format!("{start_time_s:.3}"), "playback starting");
 
     let is_network_input = source_url.starts_with("http://") || source_url.starts_with("https://");
-    let mut ffmpeg = tokio::process::Command::new("ffmpeg");
+    let mut ffmpeg = tokio::process::Command::new(ffmpeg_program());
     ffmpeg
         .arg("-nostdin")
         .arg("-loglevel")
@@ -1578,6 +2078,7 @@ async fn playback_loop(
 
     let mut pcm = vec![0u8; frame_bytes];
     let mut float_buf = vec![0f32; frame_samples_per_channel * channels];
+    let mut overlay_float_buf = vec![0f32; frame_samples_per_channel * channels];
     let mut opus_out = [0u8; 1275];
 
     let mut reverb = SimpleReverb::new();
@@ -1618,6 +2119,7 @@ async fn playback_loop(
     let mut underruns_window: u64 = 0;
     let mut underruns_consecutive: u64 = 0;
     let mut logged_first_pcm = false;
+    let mut emitted_started = false;
 
     let mut pcm_buf: VecDeque<Vec<u8>> = VecDeque::new();
 
@@ -1638,6 +2140,7 @@ async fn playback_loop(
 
     let fade_total_samples_per_channel: usize = 48000 / 1000 * 80;
     let mut fade_pos_samples_per_channel: usize = 0;
+    let mut duck_gain: f32 = 1.0;
 
     'main: loop {
         if cancel.is_cancelled() {
@@ -1743,6 +2246,40 @@ async fn playback_loop(
             info!(underruns_total = %underruns_total, "playback underrun (sending silence frames to keep cadence)");
         }
 
+        let (overlay_frame, overlay_active, overlay_duck_db) = {
+            let slot = overlay.lock().await;
+            if let Some(control) = slot.as_ref() {
+                let active = control.active.load(Ordering::Relaxed);
+                let duck_db = control.duck_db;
+                let frame = control.queue.lock().await.pop_front();
+                (frame, active, duck_db)
+            } else {
+                (None, false, 12.0)
+            }
+        };
+        let overlay_present = overlay_frame.is_some();
+        if let Some(frame) = overlay_frame.as_ref() {
+            if frame.len() == frame_bytes {
+                for i in 0..(frame_samples_per_channel * channels) {
+                    let lo = frame[i * 2];
+                    let hi = frame[i * 2 + 1];
+                    overlay_float_buf[i] = i16::from_le_bytes([lo, hi]) as f32 / 32768.0;
+                }
+            } else {
+                overlay_float_buf.fill(0.0);
+            }
+        } else {
+            overlay_float_buf.fill(0.0);
+        }
+        let overlay_is_active = overlay_active || overlay_present;
+        let target_duck = if overlay_is_active {
+            10.0_f32.powf(-overlay_duck_db / 20.0)
+        } else {
+            1.0
+        };
+        let smoothing = if target_duck < duck_gain { 0.18 } else { 0.04 };
+        duck_gain += (target_duck - duck_gain) * smoothing;
+
         let (vol, fx_pan, fx_width, fx_swap_lr, fx_bass_db, fx_reverb_mix) = {
             let st = status.lock().await;
             let r = (st.volume_percent as f32 / 100.0).clamp(0.0, 2.0);
@@ -1776,6 +2313,12 @@ async fn playback_loop(
             }
             fade_pos_samples_per_channel = (fade_pos_samples_per_channel + frame_samples_per_channel)
                 .min(fade_total_samples_per_channel);
+        }
+
+        if overlay_is_active || (duck_gain - 1.0).abs() > 0.001 {
+            for i in 0..(frame_samples_per_channel * channels) {
+                float_buf[i] = float_buf[i] * duck_gain + overlay_float_buf[i];
+            }
         }
 
         let bass_gain = 10.0_f32.powf(fx_bass_db / 20.0);
@@ -1865,6 +2408,14 @@ async fn playback_loop(
 
         let _ = ts3_audio_tx.send(packet).await;
 
+        if got_real_frame && !emitted_started {
+            emitted_started = true;
+            // PlaybackEvent.Type: STARTED=1. Emit at the first real output
+            // frame, after ffmpeg startup and prebuffering, so consumers can
+            // align wall-clock-driven features such as timestamped lyrics.
+            emit_playback(&events_tx, 1, title.clone(), source_url.clone(), "first_pcm");
+        }
+
         if now >= diag_next {
             diag_next = now + Duration::from_secs(5);
             if underruns_window > 0 || clipped_samples > 0 || tick_jitter_max_ms > 25 {
@@ -1920,6 +2471,8 @@ async fn main() -> Result<()> {
     let (ts3_audio_tx, ts3_audio_rx) = mpsc::channel::<OutPacket>(200);
     let (ts3_notice_tx, ts3_notice_rx) = mpsc::channel::<(i32, String)>(50);
     let (ts3_cmd_tx, ts3_cmd_rx) = mpsc::channel::<OutCommand>(50);
+    let (ts3_nickname_tx, ts3_nickname_rx) = mpsc::channel::<NicknameUpdateRequest>(20);
+    let (ts3_avatar_tx, ts3_avatar_rx) = mpsc::channel::<PathBuf>(10);
 
     let (events_tx, _events_rx) = broadcast::channel::<voicev1::Event>(512);
 
@@ -1958,7 +2511,7 @@ async fn main() -> Result<()> {
         let events_tx_clone = events_tx.clone();
         let shutdown_token_clone = shutdown_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = ts3_actor(ts3_audio_rx, ts3_notice_rx, ts3_cmd_rx, events_tx_clone, shutdown_token_clone).await {
+            if let Err(e) = ts3_actor(ts3_audio_rx, ts3_notice_rx, ts3_cmd_rx, ts3_nickname_rx, ts3_avatar_rx, events_tx_clone, shutdown_token_clone).await {
                 error!(%e, "ts3 actor exited");
             }
         })
@@ -2041,9 +2594,12 @@ async fn main() -> Result<()> {
     let svc = VoiceServiceImpl {
         status: Arc::new(Mutex::new(init_status)),
         playback: Arc::new(Mutex::new(None)),
+        overlay: Arc::new(Mutex::new(None)),
         ts3_audio_tx,
         ts3_notice_tx,
         ts3_cmd_tx,
+        ts3_nickname_tx,
+        ts3_avatar_tx,
         events_tx,
         persist_tx,
     };

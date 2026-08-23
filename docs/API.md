@@ -125,9 +125,12 @@ x-netease-cookie: <cookie字符串>
 {
   "lyrics": [
     { "time": 12.34, "text": "歌词内容" }
-  ]
+  ],
+  "plain_lyrics": ""
 }
 ```
+
+`lyrics` 只包含主歌词的时间轴；当音乐源没有可用时间戳但有主歌词文本时，`lyrics` 为空、`plain_lyrics` 返回整段文本。两者不会同时用于频道发送。
 
 ### 3.4 时间和时长单位
 
@@ -711,6 +714,7 @@ curl -X POST "http://127.0.0.1:8009/external/queue" \
 - QQ 音乐会尝试使用服务端管理员 QQ 音乐 cookie
 - B 站队列项会尝试读取视频字幕，并按歌曲标题/歌手倾向选择更合适的语言轨道
 - 如果配置了管理员 B 站 Cookie，后端会在公开视频接口拿不到字幕时继续尝试登录态 API 和 Playwright 页面抓取
+- TeamSpeak 频道歌词由 backend 按实际播放时钟发送到当前频道，发送目标使用 `target_mode=2`
 
 ## 8. 网易云接口 `/netease/*`
 

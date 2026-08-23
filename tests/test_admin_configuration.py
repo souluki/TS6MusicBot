@@ -1,8 +1,11 @@
 import json
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+
+from PIL import Image
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -22,7 +25,7 @@ from backend.config import settings
 from backend.db import Base
 from backend.models import AdminCredential
 from backend import managed_assets
-from backend.managed_assets import ASSET_BY_KEY, asset_path, delete_asset, save_asset, validate_image
+from backend.managed_assets import ASSET_BY_KEY, asset_path, delete_asset, prepare_ts_avatar, save_asset, validate_image
 from backend.runtime_config import (
     DEFINITION_BY_KEY,
     get_value,
@@ -204,9 +207,21 @@ class RuntimeSettingsTests(unittest.TestCase):
         first = json.loads(self.voice_file.read_text(encoding="utf-8"))
         write_voice_config(self.session, force_restart=True)
         second = json.loads(self.voice_file.read_text(encoding="utf-8"))
-        self.assertEqual(str(asset_path(avatar)), first["TSBOT_TS3_AVATAR_FILE"])
+        self.assertEqual("./data/uploads/teamspeak-avatar", first["TSBOT_TS3_AVATAR_FILE"])
         self.assertTrue(first["TSBOT_VOICE_CONFIG_REVISION"])
         self.assertNotEqual(first["TSBOT_VOICE_CONFIG_REVISION"], second["TSBOT_VOICE_CONFIG_REVISION"])
+
+    def test_ts_avatar_is_normalized_to_teamspeak_safe_size(self) -> None:
+        source = Image.new("RGB", (1600, 1600), (40, 120, 220))
+        raw = BytesIO()
+        source.save(raw, format="PNG")
+
+        normalized = prepare_ts_avatar(raw.getvalue())
+
+        self.assertLessEqual(len(normalized), 64 * 1024)
+        with Image.open(BytesIO(normalized)) as image:
+            self.assertEqual("JPEG", image.format)
+            self.assertLessEqual(max(image.size), 256)
 
 
 if __name__ == "__main__":

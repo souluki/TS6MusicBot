@@ -57,6 +57,25 @@ DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("voice.ts3_channel_id", "teamspeak", "频道 ID", env="TSBOT_TS3_CHANNEL_ID", restart="voice"),
     SettingDefinition("voice.ts3_channel_path", "teamspeak", "频道路径", env="TSBOT_TS3_CHANNEL_PATH", restart="voice"),
     SettingDefinition("voice.ts3_channel_password", "teamspeak", "频道密码", type="password", env="TSBOT_TS3_CHANNEL_PASSWORD", sensitive=True, restart="voice"),
+    SettingDefinition(
+        "voice.welcome_channel_id",
+        "teamspeak",
+        "欢迎语音目标频道 ID",
+        help="用户进入此频道时触发欢迎语音；Bot 不在此频道时跳过，不会自动移动 Bot。留空表示关闭。",
+    ),
+    SettingDefinition(
+        "voice.ts_lyrics_enabled",
+        "teamspeak",
+        "当前频道歌词同步",
+        type="boolean",
+        default=True,
+        help="开启后将主歌词按播放时间发送到 Bot 当前 TeamSpeak 文字频道；默认开启。",
+    ),
+    SettingDefinition("voice.netease_dynamic_avatar", "teamspeak", "网易云动态专辑头像", type="boolean", default=False, help="播放网易云歌曲时，将 Bot 头像更新为当前歌曲专辑图。"),
+    SettingDefinition("voice.netease_dynamic_nickname", "teamspeak", "网易云动态歌曲昵称", type="boolean", default=False, help="播放网易云歌曲时，将 Bot 昵称更新为当前歌曲名。"),
+    SettingDefinition("voice.netease_dynamic_description", "teamspeak", "网易云动态客户端简介", type="boolean", default=False, help="播放网易云歌曲时更新客户端简介；简介不会持续写入歌词。"),
+    SettingDefinition("voice.welcome_global_cooldown_seconds", "teamspeak", "欢迎语音全局冷却（秒）", type="integer", default=10, minimum=0, maximum=86400, help="多人同时进入时的全局冷却时间。"),
+    SettingDefinition("voice.welcome_user_cooldown_seconds", "teamspeak", "欢迎语音用户冷却（秒）", type="integer", default=300, minimum=0, maximum=604800, help="同一用户重复进入时的冷却时间。"),
     SettingDefinition("voice.ts3_identity_file", "teamspeak", "Identity 文件", env="TSBOT_TS3_IDENTITY_FILE", default="./logs/identity.json", restart="voice"),
     SettingDefinition("voice.ts3_identity", "teamspeak", "Identity 内容", type="secret", env="TSBOT_TS3_IDENTITY", sensitive=True, restart="voice"),
     SettingDefinition("voice.allow_direct_description", "teamspeak", "允许直接更新客户端简介", type="boolean", env="TSBOT_TS3_ALLOW_DIRECT_CLIENTUPDATE_DESCRIPTION", default=False, restart="voice"),
@@ -273,6 +292,18 @@ def _voice_env(session: Session) -> dict[str, str]:
     return result
 
 
+def _portable_command(value: str) -> str:
+    """Keep executable settings portable across Windows/Linux deployments."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    # A configured absolute FFmpeg path is useful to the current process, but
+    # must not be persisted in the repository-shared voice config.
+    if Path(candidate).is_absolute() or re.match(r"^[A-Za-z]:[\\/]", candidate) or candidate.startswith(("\\\\", "/")):
+        return "ffmpeg"
+    return candidate
+
+
 def write_voice_config(session: Session, *, force_restart: bool = False) -> str:
     path = Path(settings.voice_config_file)
     if not path.is_absolute():
@@ -283,6 +314,9 @@ def write_voice_config(session: Session, *, force_restart: bool = False) -> str:
         previous = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         previous = {}
+    ffmpeg = _portable_command(previous.get("TSBOT_FFMPEG") or os.getenv("TSBOT_FFMPEG") or "")
+    if ffmpeg:
+        values["TSBOT_FFMPEG"] = ffmpeg
     revision = str(previous.get("TSBOT_VOICE_CONFIG_REVISION") or "")
     if force_restart:
         revision = str(time.time_ns())

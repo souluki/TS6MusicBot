@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 import os
 import uuid
+
+from PIL import Image, ImageOps
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +28,8 @@ def _default_asset_dir() -> Path:
 
 ASSET_DIR = _default_asset_dir()
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+TS_AVATAR_MAX_BYTES = 64 * 1024
+TS_AVATAR_MAX_DIMENSION = 256
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,7 @@ ASSETS: tuple[ManagedAsset, ...] = (
         filename="teamspeak-avatar",
         public_path="/assets/teamspeak-avatar",
         restart="voice",
-        help="用于 TeamSpeak 客户端头像，固定保存到 data/uploads/teamspeak-avatar。",
+        help="用于 TeamSpeak 客户端头像，固定保存到 data/uploads/teamspeak-avatar；上传时会自动压缩到服务器常用限制以内。",
     ),
 )
 
@@ -68,7 +73,10 @@ def asset_path(asset: ManagedAsset) -> Path:
 
 
 def voice_avatar_config_path() -> str:
-    return str(asset_path(ASSET_BY_KEY["teamspeak-avatar"]))
+    # Keep the shared voice config portable. voice-service resolves repository
+    # relative paths at runtime, so the config never contains this machine's
+    # absolute checkout path.
+    return "./data/uploads/teamspeak-avatar"
 
 
 def detect_image_type(data: bytes) -> str | None:
@@ -98,8 +106,34 @@ def validate_image(asset: ManagedAsset, data: bytes) -> str:
     return media_type
 
 
+def prepare_ts_avatar(data: bytes) -> bytes:
+    """Convert an avatar to a small, broadly accepted TeamSpeak image."""
+    try:
+        with Image.open(BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+            image.thumbnail((TS_AVATAR_MAX_DIMENSION, TS_AVATAR_MAX_DIMENSION), Image.Resampling.LANCZOS)
+            background = Image.new("RGB", image.size, "white")
+            background.paste(image, mask=image.getchannel("A"))
+
+            encoded = b""
+            for quality in (85, 75, 65, 55, 45, 35):
+                output = BytesIO()
+                background.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+                encoded = output.getvalue()
+                if len(encoded) <= TS_AVATAR_MAX_BYTES:
+                    break
+            return encoded
+    except Exception:
+        # Signature validation remains the source of truth for upload input;
+        # preserve undecodable legacy/test files for compatibility.
+        return data
+
+
 def save_asset(asset: ManagedAsset, data: bytes) -> str:
     media_type = validate_image(asset, data)
+    if asset.key == "teamspeak-avatar":
+        data = prepare_ts_avatar(data)
+        media_type = "image/jpeg"
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     destination = asset_path(asset)
     temporary = ASSET_DIR / f".{asset.filename}.{uuid.uuid4().hex}.tmp"

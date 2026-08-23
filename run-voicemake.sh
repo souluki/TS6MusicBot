@@ -36,10 +36,10 @@ if [[ ! -x "$VOICE_BIN" ]]; then
   exit 1
 fi
 
-export TSBOT_TS3_HOST="${TSBOT_TS3_HOST:-47.113.188.213}"
+export TSBOT_TS3_HOST="${TSBOT_TS3_HOST:-127.0.0.1}"
 export TSBOT_TS3_PORT="${TSBOT_TS3_PORT:-9987}"
 export TSBOT_TS3_NICKNAME="${TSBOT_TS3_NICKNAME:-tsbot}"
-export TSBOT_TS3_CHANNEL_ID="${TSBOT_TS3_CHANNEL_ID:-2}"
+export TSBOT_TS3_CHANNEL_ID="${TSBOT_TS3_CHANNEL_ID:-}"
 
 echo "Starting voice service..."
 echo "Use Ctrl+C to stop gracefully"

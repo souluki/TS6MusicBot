@@ -30,6 +30,8 @@ const selectedCategory = ref('全部')
 const playlists = ref<any[]>([])
 const highQualityPlaylists = ref<any[]>([])
 const recommendPlaylists = ref<any[]>([])
+const playlistInput = ref('')
+const resolvedPlaylist = ref<any>(null)
 
 const scrollEl = ref<HTMLElement | null>(null)
 const STATE_KEY = 'tsbot:state:/playlists'
@@ -127,13 +129,16 @@ onBeforeRouteLeave(() => {
   return true
 })
 
-async function addPlaylistToQueue(playlist: any) {
+async function addPlaylistToQueue(playlist: any, resolvedTracks?: any[]) {
   error.value = ''
   status.value = ''
   
   try {
-    const detailRes = await apiGet<any>(`/netease/playlist/${playlist.id}/detail`)
-    const tracks = detailRes?.playlist?.tracks || []
+    let tracks = resolvedTracks || []
+    if (!tracks.length) {
+      const detailRes = await apiGet<any>(`/netease/playlist/${playlist.id}/detail`)
+      tracks = detailRes?.playlist?.tracks || []
+    }
     
     if (tracks.length === 0) {
       error.value = '歌单为空或无法获取歌曲'
@@ -169,6 +174,34 @@ async function addPlaylistToQueue(playlist: any) {
   } catch (e: any) {
     error.value = String(e?.message ?? e)
   }
+}
+
+async function resolvePlaylistByInput() {
+  const value = playlistInput.value.trim()
+  if (!value) {
+    error.value = '请输入网易云歌单 ID 或歌单链接'
+    return
+  }
+
+  error.value = ''
+  status.value = ''
+  resolvedPlaylist.value = null
+  try {
+    const res = await apiGet<any>(`/netease/playlist/resolve?value=${encodeURIComponent(value)}`)
+    const playlist = res?.playlist
+    if (!playlist) {
+      error.value = '未找到歌单信息'
+      return
+    }
+    resolvedPlaylist.value = playlist
+  } catch (e: any) {
+    error.value = String(e?.message ?? e)
+  }
+}
+
+async function addResolvedPlaylistToQueue() {
+  if (!resolvedPlaylist.value) return
+  await addPlaylistToQueue(resolvedPlaylist.value, resolvedPlaylist.value.tracks || [])
 }
 
 function formatPlayCount(count: number): string {
@@ -210,6 +243,36 @@ onMounted(() => {
         >
           <RefreshCw :size="16" :class="{ 'animate-spin': loading }" />
           <span class="hidden sm:inline">刷新</span>
+        </button>
+      </div>
+
+      <form class="flex flex-col sm:flex-row gap-2 mb-4" @submit.prevent="resolvePlaylistByInput">
+        <input
+          v-model="playlistInput"
+          type="text"
+          class="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+          placeholder="输入网易云歌单 ID 或链接，例如 123456"
+        />
+        <button type="submit" class="btn-primary text-sm py-2 px-4" :disabled="!playlistInput.trim()">
+          检索歌单
+        </button>
+      </form>
+
+      <div v-if="resolvedPlaylist" class="mb-4 flex flex-col sm:flex-row sm:items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 p-3">
+        <img
+          v-if="resolvedPlaylist.coverImgUrl"
+          :src="resolvedPlaylist.coverImgUrl + '?param=80y80'"
+          :alt="resolvedPlaylist.name"
+          class="h-14 w-14 rounded-lg object-cover"
+        />
+        <div class="min-w-0 flex-1">
+          <div class="truncate font-semibold text-gray-900">{{ resolvedPlaylist.name }}</div>
+          <div class="text-xs text-gray-600">
+            {{ resolvedPlaylist.creator?.nickname || '未知创建者' }} · {{ (resolvedPlaylist.tracks || []).length }} 首歌曲
+          </div>
+        </div>
+        <button type="button" class="btn-primary text-sm py-2 px-4" @click="addResolvedPlaylistToQueue">
+          全部加入队列
         </button>
       </div>
       

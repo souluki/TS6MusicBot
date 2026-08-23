@@ -66,6 +66,19 @@ class QueueItem(Base):
     source_url: Mapped[str] = mapped_column(Text)
 
 
+class CustomVoice(Base):
+    __tablename__ = "custom_voices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    command: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(255), default="")
+    stored_path: Mapped[str] = mapped_column(Text)
+    original_filename: Mapped[str] = mapped_column(String(255), default="")
+    media_type: Mapped[str] = mapped_column(String(128), default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=beijing_now)
+
+
 class HistoryItem(Base):
     __tablename__ = "history_items"
 

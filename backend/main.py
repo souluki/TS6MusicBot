@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
 from collections import deque
 import hashlib
 from html import unescape
@@ -12,6 +13,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -33,7 +35,7 @@ from .bilibili_auth import (
 )
 from .crypto import decrypt_text, encrypt_text
 from .db import create_db_and_tables, get_database_url, get_session, get_sqlite_db_path, new_session
-from .models import AdminCredential, HistoryItem, QueueItem, Secret
+from .models import AdminCredential, AppSetting, CustomVoice, HistoryItem, QueueItem, Secret
 from .auth import (
     clear_session_cookie,
     create_session,
@@ -48,13 +50,16 @@ from .auth import (
     hash_password,
 )
 from .runtime_config import (
+    DEFINITION_BY_KEY,
+    get_value,
     initialize_runtime_settings,
     settings_payload,
     update_settings,
     voice_config_revision,
     write_voice_config,
 )
-from .managed_assets import ASSET_BY_KEY, asset_path, asset_payload, delete_asset, detect_image_type, save_asset, MAX_IMAGE_BYTES
+from .managed_assets import ASSET_BY_KEY, asset_path, asset_payload, delete_asset, detect_image_type, prepare_ts_avatar, save_asset, MAX_IMAGE_BYTES
+from .managed_voice import MAX_VOICE_BYTES, delete_voice_audio, save_voice_audio
 from .netease import NeteaseClient
 from .netease_cookie import extract_netease_auth_cookie, has_netease_auth_cookie
 from .qqmusic import QQMusicClient
@@ -82,6 +87,8 @@ BILIBILI_AUDIO_DIR = REPO_ROOT / "tmp" / "bilibili_audio"
 BILIBILI_AUDIO_CACHE_TTL_SECONDS = max(0, settings.bilibili_audio_cache_ttl_hours) * 3600
 BILIBILI_AUDIO_CACHE_MAX_BYTES = max(0, settings.bilibili_audio_cache_max_mb) * 1024 * 1024
 BILIBILI_AUDIO_PARTIAL_TTL_SECONDS = max(0, settings.bilibili_audio_partial_ttl_minutes) * 60
+TS_DYNAMIC_AVATAR_DIR = REPO_ROOT / "tmp" / "ts_dynamic_avatar"
+TS_DYNAMIC_AVATAR_MAX_BYTES = 5 * 1024 * 1024
 _BILIBILI_VIDEO_ID_RE = re.compile(r"(BV[0-9A-Za-z]+|av\d+)", re.IGNORECASE)
 _BILIBILI_TAG_RE = re.compile(r"<[^>]+>")
 _BILIBILI_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
@@ -182,6 +189,7 @@ _current_source_url: str = ""
 _playback_lock = asyncio.Lock()
 _play_request_generation: int = 0
 _play_started_at: float | None = None
+_pending_playback_position_s: float | None = None
 _paused_at: float | None = None
 _paused_total_s: float = 0.0
 _current_duration_ms: int = 0
@@ -203,6 +211,17 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 _ts_desc_task: asyncio.Task[None] | None = None
 _ts_desc_requested: bool = False
 _ts_desc_last_sent_at: float = 0.0
+_ts_profile_task: asyncio.Task[None] | None = None
+_ts_profile_generation: int = 0
+_ts_dynamic_avatar_key: str = ""
+_ts_dynamic_nickname_active: bool = False
+_welcome_global_last_played_at: float = 0.0
+_welcome_user_last_played_at: dict[str, float] = {}
+_ts_lyrics_task: asyncio.Task[None] | None = None
+_ts_lyrics_generation: int = 0
+_TS_LYRICS_MIN_SEND_INTERVAL_S = 0.05
+_TS_LYRICS_PREFIX = "♪ "
+_TS_LYRICS_MAX_MESSAGE_CHARS = 700
 
 
 class SearchResponse(BaseModel):
@@ -375,12 +394,15 @@ async def _set_now_playing_queue_item(
     item_id: int | None,
     source_url: str = "",
     *,
+    track_id: str = "",
+    title: str = "",
     duration_ms: int | None = None,
     artist: str = "",
     album: str = "",
     artwork_url: str = "",
 ) -> None:
-    global _current_queue_item_id, _current_source_url, _play_started_at, _paused_at, _paused_total_s, _current_duration_ms
+    global _current_queue_item_id, _current_source_url, _play_started_at, _pending_playback_position_s
+    global _paused_at, _paused_total_s, _current_duration_ms
     global _current_artist, _current_album, _current_artwork_url
     async with _playback_lock:
         _current_queue_item_id = item_id
@@ -388,6 +410,7 @@ async def _set_now_playing_queue_item(
 
         if item_id is None:
             _play_started_at = None
+            _pending_playback_position_s = None
             _paused_at = None
             _paused_total_s = 0.0
             _current_duration_ms = 0
@@ -395,7 +418,11 @@ async def _set_now_playing_queue_item(
             _current_album = ""
             _current_artwork_url = ""
         else:
-            _play_started_at = time.monotonic()
+            # The actual clock starts when Voice reports its first output PCM
+            # frame. Starting it here would make lyrics run ahead while ffmpeg
+            # is still opening/buffering the source.
+            _play_started_at = None
+            _pending_playback_position_s = 0.0
             _paused_at = None
             _paused_total_s = 0.0
             _current_duration_ms = int(duration_ms or 0)
@@ -404,6 +431,13 @@ async def _set_now_playing_queue_item(
             _current_artwork_url = (artwork_url or "").strip()
 
     _schedule_ts_description_update()
+    _schedule_ts_profile_update(
+        track_id=track_id,
+        title=title,
+        artist=artist,
+        artwork_url=artwork_url,
+    )
+    _schedule_ts_lyrics_update(item_id)
 
 
 async def _build_ts_description(*, queue_preview: int = 5) -> str:
@@ -505,6 +539,8 @@ async def _ts_desc_worker() -> None:
             await asyncio.sleep(3.0 - (now - _ts_desc_last_sent_at))
 
         try:
+            if not _runtime_bool("voice.netease_dynamic_description"):
+                return
             desc = await _build_ts_description(queue_preview=5)
             await voice.set_client_description(desc)
             _ts_desc_last_sent_at = time.time()
@@ -514,7 +550,8 @@ async def _ts_desc_worker() -> None:
 
 async def _take_now_playing_if_match(*, source_url: str) -> int | None:
     """If current playing source_url matches, clear it and return queue item id."""
-    global _current_queue_item_id, _current_source_url, _play_started_at, _paused_at, _paused_total_s, _current_duration_ms
+    global _current_queue_item_id, _current_source_url, _play_started_at, _pending_playback_position_s
+    global _paused_at, _paused_total_s, _current_duration_ms
     global _current_artist, _current_album, _current_artwork_url
     src = (source_url or "").strip()
     async with _playback_lock:
@@ -528,13 +565,15 @@ async def _take_now_playing_if_match(*, source_url: str) -> int | None:
         _current_queue_item_id = None
         _current_source_url = ""
         _play_started_at = None
+        _pending_playback_position_s = None
         _paused_at = None
         _paused_total_s = 0.0
         _current_duration_ms = 0
         _current_artist = ""
         _current_album = ""
         _current_artwork_url = ""
-        return item_id
+    _schedule_ts_lyrics_update(None)
+    return item_id
 
 
 async def _begin_play_request(item_id: int | None = None) -> int:
@@ -616,17 +655,29 @@ async def _mark_playback_resumed() -> None:
     _schedule_ts_description_update()
 
 
+async def _snapshot_playback_clock() -> tuple[float | None, float | None, float | None, float]:
+    async with _playback_lock:
+        return (
+            _play_started_at,
+            _pending_playback_position_s,
+            _paused_at,
+            _paused_total_s,
+        )
+
+
 async def _mark_playback_seeked(position_s: float) -> None:
-    global _play_started_at, _paused_at, _paused_total_s
+    global _play_started_at, _pending_playback_position_s, _paused_at, _paused_total_s
     target = max(0.0, float(position_s))
-    now = time.monotonic()
     async with _playback_lock:
         if _current_queue_item_id is None or not _current_source_url:
             return
-        _play_started_at = now - target
+        # Voice restarts ffmpeg asynchronously. Hold the backend clock until
+        # its next first-PCM STARTED event, otherwise seek buffering would
+        # make lyrics advance before audio is audible.
+        _play_started_at = None
+        _pending_playback_position_s = target
         _paused_total_s = 0.0
-        if _paused_at is not None:
-            _paused_at = now
+        _paused_at = None
 
     _schedule_ts_description_update()
 
@@ -637,6 +688,37 @@ def _resolve_playback_position_s(*, now_s: float, started_at: float, paused_at: 
     else:
         pos = now_s - started_at - paused_total_s
     return max(0.0, pos)
+
+
+async def _mark_playback_started(source_url: str) -> int | None:
+    """Start the backend playback clock after Voice emits its real start event."""
+    global _play_started_at, _pending_playback_position_s, _paused_at, _paused_total_s
+    src = (source_url or "").strip()
+    async with _playback_lock:
+        if _current_queue_item_id is None or _current_source_url != src:
+            return None
+        if _play_started_at is None:
+            start_position = max(0.0, float(_pending_playback_position_s or 0.0))
+            _play_started_at = time.monotonic() - start_position
+            _pending_playback_position_s = None
+            _paused_at = None
+            _paused_total_s = 0.0
+        item_id = _current_queue_item_id
+    _schedule_ts_description_update()
+    _schedule_ts_lyrics_update(item_id)
+    return item_id
+
+
+async def _restore_playback_clock(
+    state: tuple[float | None, float | None, float | None, float],
+) -> None:
+    global _play_started_at, _pending_playback_position_s, _paused_at, _paused_total_s
+    async with _playback_lock:
+        _play_started_at, _pending_playback_position_s, _paused_at, _paused_total_s = state
+        item_id = _current_queue_item_id
+    _schedule_ts_description_update()
+    if item_id is not None:
+        _schedule_ts_lyrics_update(item_id)
 
 
 async def _hydrate_bilibili_track_metadata(
@@ -763,6 +845,8 @@ async def _play_queue_item_internal(item_id: int, *, requested_by: str) -> bool:
         await _set_now_playing_queue_item(
             int(item.id),
             playback_source_url,
+            track_id=str(item.track_id or ""),
+            title=str(item.title or ""),
             duration_ms=duration_ms,
             artist=artist,
             album=album,
@@ -2458,16 +2542,26 @@ async def voice_play() -> dict:
         await _auto_play_next_from_queue()
         return {"ok": True, "action": "play_next"}
     if cur == "STATE_PAUSED":
+        old_clock_state = await _snapshot_playback_clock()
         await _mark_playback_resumed()
-        await voice.resume()
+        try:
+            await voice.resume()
+        except Exception:
+            await _restore_playback_clock(old_clock_state)
+            raise
         return {"ok": True, "action": "resume"}
     return {"ok": True, "action": "noop"}
 
 
 @app.post("/voice/pause")
 async def voice_pause() -> dict:
+    old_clock_state = await _snapshot_playback_clock()
     await _mark_playback_paused()
-    await voice.pause()
+    try:
+        await voice.pause()
+    except Exception:
+        await _restore_playback_clock(old_clock_state)
+        raise
     return {"ok": True}
 
 
@@ -2608,6 +2702,7 @@ class LyricLine(BaseModel):
 
 class LyricsResponse(BaseModel):
     lyrics: list[LyricLine]
+    plain_lyrics: str = ""
 
 
 @app.post("/voice/seek")
@@ -2618,6 +2713,12 @@ async def voice_seek(req: SeekRequest) -> dict:
     async with _playback_lock:
         has_track = _current_queue_item_id is not None and bool(_current_source_url)
         duration_ms = int(_current_duration_ms or 0)
+        old_clock_state = (
+            _play_started_at,
+            _pending_playback_position_s,
+            _paused_at,
+            _paused_total_s,
+        )
 
     if not has_track:
         raise HTTPException(status_code=400, detail="当前没有正在播放的歌曲")
@@ -2626,15 +2727,16 @@ async def voice_seek(req: SeekRequest) -> dict:
     if duration_ms > 0:
         target_time_s = min(target_time_s, duration_ms / 1000.0)
 
+    await _mark_playback_seeked(target_time_s)
     try:
         await voice.seek(target_time_s)
     except RuntimeError as e:
+        await _restore_playback_clock(old_clock_state)
         detail = str(e) or "seek failed"
         if "no active playback" in detail.lower():
             raise HTTPException(status_code=409, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
 
-    await _mark_playback_seeked(target_time_s)
     return {"ok": True, "time": target_time_s}
 
 
@@ -2798,6 +2900,78 @@ def _parse_lrc_to_lines(lrc: str) -> list[LyricLine]:
     return lines
 
 
+def _parse_lrc_content(lrc: str) -> tuple[list[LyricLine], str]:
+    """Parse primary LRC content and retain a no-timestamp fallback."""
+    raw = str(lrc or "")
+    timestamped = _parse_lrc_to_lines(raw)
+    if timestamped:
+        return timestamped, ""
+
+    plain_lines: list[str] = []
+    for raw_line in raw.splitlines():
+        text = raw_line.strip()
+        if not text:
+            continue
+        if text.startswith("[") and "]" in text:
+            tag = text[1 : text.find("]")].strip()
+            tag_name = tag.split(":", 1)[0].strip()
+            # A timestamp-less response may still contain LRC metadata or
+            # auxiliary translation/romanization tags.  They are not primary
+            # lyrics and must never enter the one-message fallback.
+            if ":" in tag and not tag_name.isdigit():
+                continue
+            text = text.split("]", 1)[1].strip()
+        if text:
+            plain_lines.append(text)
+    return [], "\n".join(plain_lines).strip()
+
+
+def _merge_timestamped_lyrics(
+    primary: list[LyricLine],
+    translated: list[LyricLine],
+    *,
+    max_time_delta: float = 0.75,
+) -> list[LyricLine]:
+    """Append a matching translated line without changing primary timestamps."""
+    if not primary or not translated:
+        return list(primary)
+
+    translated = sorted(translated, key=lambda line: line.time)
+    merged: list[LyricLine] = []
+    used: set[int] = set()
+    for line in primary:
+        candidates = (
+            (abs(other.time - line.time), index, other)
+            for index, other in enumerate(translated)
+            if index not in used and other.text.strip()
+        )
+        match = min(candidates, default=None, key=lambda item: item[0])
+        text = line.text.strip()
+        if match is not None and match[0] <= max_time_delta:
+            _, index, other = match
+            translation = other.text.strip()
+            if translation and translation != text:
+                text = f"{text}\n译：{translation}" if text else translation
+            used.add(index)
+        merged.append(LyricLine(time=line.time, text=text))
+    return merged
+
+
+def _merge_plain_lyrics(primary: str, translated: str) -> str:
+    """Merge untimestamped fallback lyrics line by line when possible."""
+    primary_lines = [line.strip() for line in (primary or "").splitlines() if line.strip()]
+    translated_lines = [line.strip() for line in (translated or "").splitlines() if line.strip()]
+    if not primary_lines:
+        return "\n".join(translated_lines)
+    if not translated_lines:
+        return "\n".join(primary_lines)
+    merged: list[str] = []
+    for index, line in enumerate(primary_lines):
+        translation = translated_lines[index] if index < len(translated_lines) else ""
+        merged.append(f"{line}\n译：{translation}" if translation and translation != line else line)
+    return "\n".join(merged)
+
+
 @app.get("/lyrics/{queue_item_id}", response_model=LyricsResponse)
 async def lyrics(queue_item_id: int) -> LyricsResponse:
     session = new_session()
@@ -2827,7 +3001,14 @@ async def lyrics(queue_item_id: int) -> LyricsResponse:
 
         data = await netease.lyric(song_id=song_id, cookie=cookie)
         lrc = (((data or {}).get("lrc") or {}).get("lyric") or "")
-        return LyricsResponse(lyrics=_parse_lrc_to_lines(str(lrc)))
+        translated_lrc = (((data or {}).get("tlyric") or {}).get("lyric") or "")
+        parsed, plain = _parse_lrc_content(str(lrc))
+        translated, translated_plain = _parse_lrc_content(str(translated_lrc))
+        if parsed and translated:
+            parsed = _merge_timestamped_lyrics(parsed, translated)
+        elif plain and translated_plain:
+            plain = _merge_plain_lyrics(plain, translated_plain)
+        return LyricsResponse(lyrics=parsed, plain_lyrics=plain)
     
     elif track_id.startswith("qqmusic:"):
         # QQ 音乐歌词
@@ -2844,7 +3025,8 @@ async def lyrics(queue_item_id: int) -> LyricsResponse:
             # 获取 QQ 音乐歌词
             data = await qqmusic.get_song_lyric(song_mid)
             lrc = data.get("lyric", "") if data else ""
-            return LyricsResponse(lyrics=_parse_lrc_to_lines(str(lrc)))
+            parsed, plain = _parse_lrc_content(str(lrc))
+            return LyricsResponse(lyrics=parsed, plain_lyrics=plain)
         except Exception:
             return LyricsResponse(lyrics=[])
 
@@ -3155,6 +3337,7 @@ def _format_help() -> str:
         "队列|queue - show queue\n"
         "歌单|playlist <keywords> - search Netease playlists\n"
         "选择|select <number> - add a playlist from the last playlist search\n"
+        "歌单ID <id|Netease URL> - add a Netease playlist directly to the queue\n"
         "清空|clear - clear the current queue\n"
         "顺序播放|order / 随机播放|random - switch queue playback mode\n"
         "暂停|pause / 恢复|resume / 停止|stop / 跳过|skip\n"
@@ -3168,6 +3351,31 @@ def _try_parse_song_id(s: str) -> str | None:
     t = (s or "").strip()
     if t.isdigit():
         return t
+    return None
+
+
+def _try_parse_netease_playlist_id(value: str) -> str | None:
+    """Parse a Netease playlist ID from a number or a standard Netease URL."""
+    text = (value or "").strip().strip("<>[]()")
+    if text.isdigit():
+        return text
+    if not text.lower().startswith(("http://", "https://")):
+        return None
+
+    parsed = urlparse(text)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "music.163.com" and not hostname.endswith(".music.163.com"):
+        return None
+
+    query = parse_qs(parsed.query)
+    candidates = list(query.get("id") or [])
+    fragment = parsed.fragment or ""
+    if "?" in fragment:
+        candidates.extend(parse_qs(fragment.split("?", 1)[1]).get("id") or [])
+    for candidate in candidates:
+        normalized = str(candidate).strip()
+        if normalized.isdigit():
+            return normalized
     return None
 
 
@@ -3273,6 +3481,389 @@ async def _load_netease_playlist_tracks(
     return name, resolved or tracks
 
 
+async def _enqueue_netease_playlist(
+    playlist_id: str,
+    *,
+    requested_by: str,
+) -> tuple[str, int, int, bool]:
+    """Load a Netease playlist and enqueue every usable track."""
+    cookie = _get_admin_cookie_or_none()
+    detail = await netease.playlist_detail(playlist_id=playlist_id, cookie=cookie)
+    playlist_name, tracks = await _load_netease_playlist_tracks(detail, cookie=cookie)
+    if not tracks:
+        return playlist_name or playlist_id, 0, 0, False
+
+    added = 0
+    failed = 0
+    for track in tracks:
+        normalized = _normalize_netease_song(track)
+        if normalized is None:
+            failed += 1
+            continue
+        try:
+            await _enqueue_netease_song(
+                song_id=str(normalized["song_id"]),
+                title=str(normalized["title"]),
+                artist=str(normalized["artist"]),
+                play_now=False,
+                requested_by=requested_by,
+                album=str(normalized.get("album") or ""),
+                duration_ms=normalized.get("duration_ms"),
+                artwork_url=str(normalized.get("artwork_url") or ""),
+                quality_level="auto",
+            )
+            added += 1
+        except Exception:
+            failed += 1
+
+    auto_started = False
+    if added:
+        try:
+            st = await voice.get_status()
+            cur = str(getattr(st, "state", "") or "").strip().upper()
+            if cur == "STATE_IDLE":
+                await _auto_play_next_from_queue()
+                auto_started = True
+        except Exception:
+            pass
+
+    return playlist_name or playlist_id, added, failed, auto_started
+
+
+def _runtime_bool(key: str) -> bool:
+    session = new_session()
+    try:
+        definition = DEFINITION_BY_KEY.get(key)
+        return bool(definition and get_value(session, definition))
+    finally:
+        session.close()
+
+
+def _runtime_int(key: str, default: int) -> int:
+    session = new_session()
+    try:
+        definition = DEFINITION_BY_KEY.get(key)
+        if definition is None:
+            return default
+        try:
+            return max(0, int(get_value(session, definition)))
+        except (TypeError, ValueError):
+            return default
+    finally:
+        session.close()
+
+
+def _truncate_ts_nickname(value: str) -> str:
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    return text[:64].strip()
+
+
+def _schedule_ts_profile_update(*, track_id: str, title: str, artist: str = "", artwork_url: str) -> None:
+    global _ts_profile_task, _ts_profile_generation
+    _ts_profile_generation += 1
+    generation = _ts_profile_generation
+
+    async def worker() -> None:
+        global _ts_dynamic_avatar_key, _ts_dynamic_nickname_active
+        await asyncio.sleep(0.2)
+        if generation != _ts_profile_generation:
+            return
+        is_netease = str(track_id or "").startswith("netease:")
+        nickname_enabled = _runtime_bool("voice.netease_dynamic_nickname")
+        avatar_enabled = _runtime_bool("voice.netease_dynamic_avatar")
+        if is_netease and nickname_enabled:
+            nickname = _truncate_ts_nickname(title)
+            # TeamSpeak rejects nicknames shorter than three characters with
+            # ParameterInvalidSize. Keep short song titles readable by adding
+            # the artist, instead of silently leaving the previous nickname.
+            if len(nickname) < 3:
+                artist_text = _truncate_ts_nickname(artist)
+                nickname = f"{nickname} - {artist_text}" if artist_text else f"{nickname}♪"
+            if nickname:
+                nickname_updated = False
+                for retry_index, retry_delay in enumerate((0.0, 0.6, 1.2)):
+                    if retry_delay:
+                        await asyncio.sleep(retry_delay)
+                    if generation != _ts_profile_generation:
+                        return
+                    try:
+                        if await voice.set_client_nickname(nickname):
+                            nickname_updated = True
+                            _ts_dynamic_nickname_active = True
+                            break
+                    except Exception:
+                        if retry_index == 2:
+                            logger.exception("网易云动态昵称更新失败")
+                if not nickname_updated:
+                    logger.warning("网易云动态昵称更新被语音服务拒绝: %s", nickname)
+        elif _ts_dynamic_nickname_active:
+            try:
+                default_nickname = _runtime_string("voice.ts3_nickname", "tsbot")
+                if await voice.set_client_nickname(default_nickname):
+                    _ts_dynamic_nickname_active = False
+                else:
+                    logger.warning("恢复默认昵称被语音服务拒绝: %s", default_nickname)
+            except Exception:
+                logger.exception("恢复默认昵称失败")
+        if is_netease and avatar_enabled and str(artwork_url or "").strip():
+            await _update_ts_dynamic_avatar(str(artwork_url).strip(), generation=generation)
+        elif _ts_dynamic_avatar_key:
+            fixed_avatar = asset_path(ASSET_BY_KEY["teamspeak-avatar"])
+            if fixed_avatar.is_file():
+                try:
+                    if await voice.set_client_avatar(str(fixed_avatar)):
+                        _ts_dynamic_avatar_key = ""
+                except Exception:
+                    logger.exception("恢复固定头像失败")
+
+    if _ts_profile_task is None or _ts_profile_task.done():
+        _ts_profile_task = asyncio.create_task(worker())
+    else:
+        _ts_profile_task.cancel()
+        _ts_profile_task = asyncio.create_task(worker())
+
+
+async def _update_ts_dynamic_avatar(artwork_url: str, *, generation: int) -> None:
+    global _ts_dynamic_avatar_key
+    if generation != _ts_profile_generation:
+        return
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            response = await client.get(artwork_url, headers={"user-agent": "TS6MusicBot/1.0"})
+            response.raise_for_status()
+            data = response.content
+        if not data or len(data) > TS_DYNAMIC_AVATAR_MAX_BYTES:
+            raise ValueError("专辑图为空或超过 5 MiB")
+        media_type = detect_image_type(data)
+        suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}.get(media_type or "")
+        if suffix is None:
+            raise ValueError("专辑图格式不受支持")
+        avatar_key = hashlib.md5(data).hexdigest()
+        if avatar_key == _ts_dynamic_avatar_key:
+            return
+        TS_DYNAMIC_AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+        path = TS_DYNAMIC_AVATAR_DIR / f"current{suffix}"
+        path.write_bytes(prepare_ts_avatar(data))
+        if generation != _ts_profile_generation:
+            return
+        if await voice.set_client_avatar(str(path)):
+            _ts_dynamic_avatar_key = avatar_key
+    except Exception:
+        logger.exception("网易云动态专辑头像更新失败")
+
+
+def _runtime_string(key: str, default: str = "") -> str:
+    session = new_session()
+    try:
+        definition = DEFINITION_BY_KEY.get(key)
+        if definition is None:
+            return default
+        value = get_value(session, definition)
+        return str(value or default).strip() or default
+    finally:
+        session.close()
+
+
+async def _refresh_ts_profile_from_current() -> None:
+    async with _playback_lock:
+        item_id = _current_queue_item_id
+        artwork_url = _current_artwork_url or ""
+    if item_id is None:
+        _schedule_ts_profile_update(track_id="", title="", artwork_url="")
+        return
+    session = new_session()
+    try:
+        item = session.get(QueueItem, int(item_id))
+        if item is None:
+            _schedule_ts_profile_update(track_id="", title="", artwork_url="")
+            return
+        _schedule_ts_profile_update(
+            track_id=str(item.track_id or ""),
+            title=str(item.title or ""),
+            artist=str(item.artist or ""),
+            artwork_url=artwork_url,
+        )
+    finally:
+        session.close()
+
+
+def _truncate_ts_lyrics(text: str, *, limit: int = _TS_LYRICS_MAX_MESSAGE_CHARS - len(_TS_LYRICS_PREFIX)) -> str:
+    normalized = (text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
+
+
+async def _get_ts_lyrics_playback_position(item_id: int) -> float | None:
+    async with _playback_lock:
+        if _current_queue_item_id != item_id or _play_started_at is None:
+            return None
+        return _resolve_playback_position_s(
+            now_s=time.monotonic(),
+            started_at=_play_started_at,
+            paused_at=_paused_at,
+            paused_total_s=_paused_total_s,
+        )
+
+
+def _find_ts_lyrics_index(lines: list[LyricLine], position_s: float) -> int:
+    """Return the last line at or before a seek position."""
+    position = max(0.0, float(position_s))
+    return bisect_right([line.time for line in lines], position) - 1
+
+
+async def _send_ts_lyrics_line(text: str) -> bool:
+    """Send one line, retrying transient TS/gRPC failures without losing the line."""
+    message = text if text.startswith(_TS_LYRICS_PREFIX) else f"{_TS_LYRICS_PREFIX}{text}"
+    delays = (0.0, 0.2, 0.5)
+    for delay in delays:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            accepted = await voice.send_notice(message, target_mode=2)
+            if accepted is False:
+                raise RuntimeError("voice notice queue rejected the message")
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("TS lyrics send failed, retrying: %s", exc)
+    return False
+
+
+async def _send_ts_plain_lyrics(item_id: int, generation: int, text: str) -> bool:
+    """Keep one plain-lyrics message pending until TS recovers or the track changes."""
+    while generation == _ts_lyrics_generation:
+        if await _send_ts_lyrics_line(text):
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _reschedule_ts_lyrics_from_current() -> None:
+    async with _playback_lock:
+        item_id = _current_queue_item_id
+    _schedule_ts_lyrics_update(item_id)
+
+
+async def _run_ts_timestamped_lyrics(
+    item_id: int,
+    generation: int,
+    lines: list[LyricLine],
+) -> None:
+    if not lines:
+        return
+    index = 0
+    previous_position: float | None = None
+    last_sent_text = ""
+    last_sent_at = 0.0
+    lyric_times = [line.time for line in lines]
+    while index < len(lines):
+        if generation != _ts_lyrics_generation:
+            return
+
+        position = await _get_ts_lyrics_playback_position(item_id)
+        if position is None:
+            return
+
+        # A seek in either direction causes a large clock jump. Reposition to
+        # the current line at/before the new playback position rather than
+        # replaying stale lines from the old cursor.
+        seeked = False
+        if previous_position is None:
+            # Lyrics may arrive after playback has already started. Do not
+            # burst-send every old line; begin at the current clock position.
+            index = max(0, _find_ts_lyrics_index(lines, position))
+            if position < lyric_times[0]:
+                index = 0
+        elif position + 0.15 < previous_position or position - previous_position > 0.75:
+            seeked = True
+            index = max(0, _find_ts_lyrics_index(lines, position))
+            if position < lyric_times[0]:
+                index = 0
+        if seeked:
+            # A seek is a new presentation position.  Do not suppress the
+            # current line just because its text matched the last line before
+            # the seek (common with repeated choruses).
+            last_sent_text = ""
+            last_sent_at = 0.0
+        previous_position = position
+        if index >= len(lines):
+            return
+
+        line = lines[index]
+        remaining = line.time - position
+        if remaining > 0.05:
+            await asyncio.sleep(min(0.25, max(0.05, remaining)))
+            continue
+
+        text = _truncate_ts_lyrics(line.text)
+        if text == last_sent_text:
+            index += 1
+            continue
+        if text:
+            elapsed = time.monotonic() - last_sent_at
+            if last_sent_at and elapsed < _TS_LYRICS_MIN_SEND_INTERVAL_S:
+                await asyncio.sleep(_TS_LYRICS_MIN_SEND_INTERVAL_S - elapsed)
+            if not await _send_ts_lyrics_line(text):
+                await asyncio.sleep(0.5)
+                continue
+            last_sent_text = text
+            last_sent_at = time.monotonic()
+        index += 1
+
+
+async def _load_queue_item_lyrics(queue_item_id: int) -> LyricsResponse:
+    """Load only the primary lyrics for a queue item."""
+    return await lyrics(queue_item_id)
+
+
+async def _ts_lyrics_worker(item_id: int, generation: int) -> None:
+    try:
+        response = await _load_queue_item_lyrics(item_id)
+        if generation != _ts_lyrics_generation:
+            return
+
+        if response.lyrics:
+            await _run_ts_timestamped_lyrics(item_id, generation, list(response.lyrics))
+        elif response.plain_lyrics:
+            await _send_ts_plain_lyrics(
+                item_id,
+                generation,
+                _truncate_ts_lyrics(response.plain_lyrics),
+            )
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.debug("TS lyrics update skipped for queue item %s: %s", item_id, exc)
+
+
+def _schedule_ts_lyrics_update(item_id: int | None) -> None:
+    global _ts_lyrics_task, _ts_lyrics_generation
+    _ts_lyrics_generation += 1
+    generation = _ts_lyrics_generation
+    if _ts_lyrics_task is not None and not _ts_lyrics_task.done():
+        _ts_lyrics_task.cancel()
+    _ts_lyrics_task = None
+    if item_id is None:
+        return
+    if not _runtime_bool("voice.ts_lyrics_enabled"):
+        return
+
+    def _ensure_task() -> None:
+        global _ts_lyrics_task
+        if generation != _ts_lyrics_generation:
+            return
+        _ts_lyrics_task = asyncio.create_task(_ts_lyrics_worker(int(item_id), generation))
+
+    try:
+        asyncio.get_running_loop()
+        _ensure_task()
+    except RuntimeError:
+        if _main_loop is not None:
+            _main_loop.call_soon_threadsafe(_ensure_task)
+
+
 def _ts_playlist_result_key(*, invoker_unique_id: str, invoker_name: str) -> str:
     unique_id = (invoker_unique_id or "").strip()
     if unique_id:
@@ -3302,6 +3893,214 @@ def _get_ts_playlist_results(key: str) -> list[dict[str, str]]:
         _ts_playlist_results.pop(key, None)
         return []
     return playlists
+
+
+_BUILTIN_COMMAND_NAMES = {
+    "help", "h", "?", "帮助", "菜单", "指令", "命令", "search", "s", "find", "搜", "搜索", "查",
+    "playlist", "playlists", "歌单list", "歌单", "歌单列表", "歌单id", "playlistid", "playlist-id", "歌单链接",
+    "select", "选择", "选歌单", "歌单选择", "clear", "清空", "清空队列", "random", "shuffle", "随机", "随机播放",
+    "order", "ordered", "顺序", "顺序播放", "add", "a", "加", "增加", "入队", "点歌", "play", "p", "播放",
+    "来一首", "放", "vol", "volume", "音量", "声音", "now", "np", "status", "状态", "当前", "queue", "q",
+    "队列", "列表", "pause", "暂停", "resume", "continue", "恢复", "继续", "stop", "停止", "skip", "next",
+    "跳过", "下一首", "切歌", "desc", "简介", "签名", "fx", "音效",
+}
+
+
+def _normalize_custom_voice_command(command: str) -> str:
+    normalized = (command or "").strip()
+    if normalized.startswith(("!", "！")):
+        normalized = normalized[1:].strip()
+    if not normalized or len(normalized) > 64 or any(char.isspace() for char in normalized):
+        raise ValueError("指令必须是 1-64 个字符且不能包含空格")
+    normalized = normalized.lower()
+    if normalized in _BUILTIN_COMMAND_NAMES:
+        raise ValueError("该指令名称已被系统指令占用")
+    return normalized
+
+
+def _get_welcome_voice_id(session: Session) -> int | None:
+    row = session.get(AppSetting, "voice.welcome_voice_id")
+    if row is None:
+        return None
+    try:
+        voice_id = int(str(row.value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return voice_id if voice_id > 0 else None
+
+
+def _set_welcome_voice_id(session: Session, voice_id: int | None) -> None:
+    row = session.get(AppSetting, "voice.welcome_voice_id")
+    if voice_id is None:
+        if row is not None:
+            session.delete(row)
+        return
+    value = str(int(voice_id))
+    if row is None:
+        session.add(AppSetting(key="voice.welcome_voice_id", value=value))
+    else:
+        row.value = value
+
+
+def _custom_voice_payload(row: CustomVoice, *, welcome_voice_id: int | None = None) -> dict[str, object]:
+    session = new_session()
+    try:
+        enabled = _custom_voice_is_enabled(row, session=session)
+    finally:
+        session.close()
+    return {
+        "id": int(row.id),
+        "command": row.command,
+        "label": row.label or row.command,
+        "original_filename": row.original_filename,
+        "media_type": row.media_type,
+        "size_bytes": int(row.size_bytes or 0),
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+        "is_welcome": welcome_voice_id is not None and int(row.id) == welcome_voice_id,
+        "enabled": enabled,
+    }
+
+
+def _custom_voice_setting_key(voice_id: int) -> str:
+    return f"voice.custom_voice.{int(voice_id)}.enabled"
+
+
+def _custom_voice_is_enabled(row: CustomVoice, *, session: Session | None = None) -> bool:
+    voice_id = int(getattr(row, "id", 0) or 0)
+    if voice_id <= 0:
+        return True
+    owns_session = session is None
+    active_session = session or new_session()
+    try:
+        setting = active_session.get(AppSetting, _custom_voice_setting_key(voice_id))
+        return setting is None or str(setting.value).strip().lower() not in {"0", "false", "no", "off"}
+    finally:
+        if owns_session:
+            active_session.close()
+
+
+def _set_custom_voice_enabled(session: Session, voice_id: int, enabled: bool) -> None:
+    key = _custom_voice_setting_key(voice_id)
+    row = session.get(AppSetting, key)
+    value = "1" if enabled else "0"
+    if row is None:
+        session.add(AppSetting(key=key, value=value))
+    else:
+        row.value = value
+
+
+def _find_custom_voice(command: str) -> CustomVoice | None:
+    session = new_session()
+    try:
+        return session.execute(
+            select(CustomVoice).where(CustomVoice.command == command).limit(1)
+        ).scalars().first()
+    finally:
+        session.close()
+
+
+async def _trigger_custom_voice(command: str, *, invoker_name: str) -> str:
+    row = _find_custom_voice(command)
+    if row is None:
+        return ""
+    return await _trigger_custom_voice_row(row, invoker_name=invoker_name)
+
+
+async def _trigger_custom_voice_row(row: CustomVoice, *, invoker_name: str) -> str:
+    if not _custom_voice_is_enabled(row):
+        return f"内置语音已停用：{row.label or row.command}"
+    source_path = Path(row.stored_path)
+    if not source_path.is_file():
+        return f"内置语音文件不存在：{row.label or row.command}"
+
+    title = row.label or row.command
+    status = await voice.get_status()
+    state = str(getattr(status, "state", "") or "").strip().upper()
+    if state == "STATE_PLAYING":
+        accepted = await voice.play_overlay(
+            source_url=str(source_path),
+            title=title,
+            requested_by=invoker_name,
+            duck_db=12.0,
+        )
+        if not accepted:
+            return "内置语音混音播放失败，请检查 Voice 服务日志"
+        return f"正在播放内置语音：{title}（背景音量降低 12 dB）"
+
+    await voice.play(source_url=str(source_path), title=title, requested_by=invoker_name)
+    return f"正在播放内置语音：{title}"
+
+
+def _welcome_event_matches_target(*, channel_id: int, bot_channel_id: int, target_channel_id: str) -> bool:
+    target = str(target_channel_id or "").strip()
+    return bool(target) and str(channel_id) == target and str(bot_channel_id) == target
+
+
+def _find_welcome_voice() -> CustomVoice | None:
+    session = new_session()
+    try:
+        voice_id = _get_welcome_voice_id(session)
+        if voice_id is None:
+            return None
+        return session.get(CustomVoice, voice_id)
+    finally:
+        session.close()
+
+
+def _get_welcome_channel_id() -> str:
+    session = new_session()
+    try:
+        definition = DEFINITION_BY_KEY["voice.welcome_channel_id"]
+        return str(get_value(session, definition) or "").strip()
+    finally:
+        session.close()
+
+
+def _welcome_cooldown_allows(unique_id: str) -> bool:
+    global _welcome_global_last_played_at
+    now = time.monotonic()
+    user_key = (unique_id or "").strip() or "__anonymous__"
+    user_cooldown = _runtime_int("voice.welcome_user_cooldown_seconds", 300)
+    global_cooldown = _runtime_int("voice.welcome_global_cooldown_seconds", 10)
+    last_user = _welcome_user_last_played_at.get(user_key, 0.0)
+    if global_cooldown and now - _welcome_global_last_played_at < global_cooldown:
+        return False
+    if user_cooldown and now - last_user < user_cooldown:
+        return False
+    _welcome_global_last_played_at = now
+    _welcome_user_last_played_at[user_key] = now
+    expired_before = now - max(global_cooldown, user_cooldown, 1) * 2
+    for key, timestamp in list(_welcome_user_last_played_at.items()):
+        if timestamp < expired_before:
+            _welcome_user_last_played_at.pop(key, None)
+    return True
+
+
+async def _handle_user_joined(event: object) -> None:
+    channel_id = int(getattr(event, "channel_id", 0) or 0)
+    bot_channel_id = int(getattr(event, "bot_channel_id", 0) or 0)
+    target_channel_id = _get_welcome_channel_id()
+    if not _welcome_event_matches_target(
+        channel_id=channel_id,
+        bot_channel_id=bot_channel_id,
+        target_channel_id=target_channel_id,
+    ):
+        return
+
+    row = _find_welcome_voice()
+    if row is None:
+        logger.info("welcome voice skipped: no global welcome audio configured")
+        return
+
+    unique_id = str(getattr(event, "unique_id", "") or "").strip()
+    if not _welcome_cooldown_allows(unique_id or str(getattr(event, "client_id", "") or "")):
+        logger.info("welcome voice skipped: cooldown user=%s", unique_id or "anonymous")
+        return
+
+    user_name = str(getattr(event, "name", "") or "新用户")
+    result = await _trigger_custom_voice_row(row, invoker_name=f"welcome:{user_name}")
+    if result.startswith("内置语音文件不存在"):
+        logger.warning("welcome voice skipped: %s", result)
 
 
 async def _enqueue_netease_song(
@@ -3364,6 +4163,8 @@ async def _enqueue_netease_song(
         await _set_now_playing_queue_item(
             int(item.id),
             url,
+            track_id=str(item.track_id or ""),
+            title=title,
             duration_ms=resolved_duration_ms,
             artist=final_artist,
             album=resolved_album,
@@ -3618,6 +4419,10 @@ async def _handle_chat_command(
         "歌单list": "playlist",
         "歌单": "playlist",
         "歌单列表": "playlist",
+        "歌单id": "playlist_id",
+        "playlistid": "playlist_id",
+        "playlist-id": "playlist_id",
+        "歌单链接": "playlist_id",
         "select": "select",
         "选择": "select",
         "选歌单": "select",
@@ -3681,7 +4486,9 @@ async def _handle_chat_command(
 
     cmd = alias_to_cmd.get(head_norm)
     if not cmd:
-        return
+        if _find_custom_voice(head_norm) is None:
+            return
+        cmd = "custom_voice"
     arg = tail.strip()
     invoker_key = _ts_playlist_result_key(
         invoker_unique_id=invoker_unique_id,
@@ -3697,6 +4504,12 @@ async def _handle_chat_command(
         await voice.send_notice(t, target_mode=int(target_mode))
 
     try:
+        if cmd == "custom_voice":
+            result = await _trigger_custom_voice(head_norm, invoker_name=invoker_name)
+            if result:
+                await reply(result)
+            return
+
         if cmd in ("help", "h"):
             await reply(_format_help())
             return
@@ -3783,6 +4596,29 @@ async def _handle_chat_command(
             await reply("网易云歌单搜索结果（使用 select <编号> 加入队列）：\n" + "\n".join(lines))
             return
 
+        if cmd == "playlist_id":
+            if not arg:
+                await reply("用法: 歌单ID <网易云歌单ID或链接>")
+                return
+            playlist_id = _try_parse_netease_playlist_id(arg.split()[0])
+            if not playlist_id:
+                await reply("网易云歌单 ID 或链接无效，仅支持数字 ID 和 music.163.com 歌单链接")
+                return
+            playlist_name, added, failed, auto_started = await _enqueue_netease_playlist(
+                playlist_id,
+                requested_by=invoker_name,
+            )
+            if not added and not failed:
+                await reply("歌单为空，或网易云未返回可用歌曲")
+                return
+            status = f"已从歌单《{playlist_name}》加入 {added} 首歌曲"
+            if failed:
+                status += f"，{failed} 首失败"
+            if auto_started:
+                status += "，已开始播放"
+            await reply(status)
+            return
+
         if cmd == "select":
             if not arg:
                 await reply("用法: select <歌单编号>")
@@ -3806,46 +4642,13 @@ async def _handle_chat_command(
                 return
             playlist_id = selected_playlist["id"]
 
-            cookie = _get_admin_cookie_or_none()
-            detail = await netease.playlist_detail(playlist_id=playlist_id, cookie=cookie)
-            playlist_name, tracks = await _load_netease_playlist_tracks(detail, cookie=cookie)
-            if not tracks:
+            playlist_name, added, failed, auto_started = await _enqueue_netease_playlist(
+                playlist_id,
+                requested_by=invoker_name,
+            )
+            if not added and not failed:
                 await reply("歌单为空，或网易云未返回可用歌曲")
                 return
-
-            added = 0
-            failed = 0
-            for track in tracks:
-                normalized = _normalize_netease_song(track)
-                if normalized is None:
-                    failed += 1
-                    continue
-                try:
-                    await _enqueue_netease_song(
-                        song_id=str(normalized["song_id"]),
-                        title=str(normalized["title"]),
-                        artist=str(normalized["artist"]),
-                        play_now=False,
-                        requested_by=invoker_name,
-                        album=str(normalized.get("album") or ""),
-                        duration_ms=normalized.get("duration_ms"),
-                        artwork_url=str(normalized.get("artwork_url") or ""),
-                        quality_level="auto",
-                    )
-                    added += 1
-                except Exception:
-                    failed += 1
-
-            auto_started = False
-            if added:
-                try:
-                    st = await voice.get_status()
-                    cur = str(getattr(st, "state", "") or "").strip().upper()
-                    if cur == "STATE_IDLE":
-                        await _auto_play_next_from_queue()
-                        auto_started = True
-                except Exception:
-                    pass
             label = playlist_name or selected_playlist.get("name") or playlist_id
             status = f"已从歌单《{label}》加入 {added} 首歌曲"
             if failed:
@@ -4143,11 +4946,23 @@ async def _handle_playback_finished(source_url: str) -> None:
     await _auto_play_next_from_queue()
 
 
+async def _handle_voice_log_event(message: str) -> None:
+    """恢复 TeamSpeak 重连后需要重新写入的当前动态身份。"""
+    if str(message or "").strip().lower() != "ts3 connected":
+        return
+    await _refresh_ts_profile_from_current()
+
+
 async def _chat_command_worker() -> None:
     retry_delay = 1.0
     while True:
         try:
-            async for ev in voice.subscribe_events(include_chat=True, include_playback=True, include_log=False):
+            async for ev in voice.subscribe_events(
+                include_chat=True,
+                include_playback=True,
+                include_log=True,
+                include_user_joined=True,
+            ):
                 retry_delay = 1.0
                 try:
                     if not hasattr(ev, "WhichOneof"):
@@ -4178,6 +4993,8 @@ async def _chat_command_worker() -> None:
                         ty = int(getattr(pb, "type", 0) or 0)
                         src = str(getattr(pb, "source_url", "") or "")
                         # PlaybackEvent.Type: STARTED=1, FINISHED=2, ERROR=3
+                        if ty == 1:
+                            await _mark_playback_started(src)
                         if ty == 2:
                             await _handle_playback_finished(src)
                         if ty == 3:
@@ -4192,6 +5009,14 @@ async def _chat_command_worker() -> None:
                                 except Exception:
                                     pass
                                 await _auto_play_next_from_queue()
+                        continue
+
+                    if kind == "user_joined":
+                        await _handle_user_joined(ev.user_joined)
+                        continue
+
+                    if kind == "log":
+                        await _handle_voice_log_event(str(getattr(ev.log, "message", "") or ""))
                         continue
                 except Exception:
                     logger.exception("chat worker: failed to handle event")
@@ -4360,6 +5185,13 @@ async def admin_update_settings(
             await voice.close()
         if "voice" in effects and any(key.startswith("voice.description_") for key in req.values):
             _schedule_ts_description_update()
+        if "voice.ts_lyrics_enabled" in req.values:
+            if _runtime_bool("voice.ts_lyrics_enabled"):
+                await _reschedule_ts_lyrics_from_current()
+            else:
+                _schedule_ts_lyrics_update(None)
+        if any(key.startswith("voice.netease_dynamic_") for key in req.values):
+            asyncio.create_task(_refresh_ts_profile_from_current())
     return {
         "ok": True,
         "voice_restart_requested": req.apply and "voice" in effects,
@@ -4383,6 +5215,148 @@ async def _read_managed_asset(request: Request) -> bytes:
         if len(content) > MAX_IMAGE_BYTES:
             raise HTTPException(status_code=413, detail="图片不能超过 5 MiB")
     return bytes(content)
+
+
+async def _read_custom_voice_upload(request: Request) -> bytes:
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length:
+        try:
+            if int(content_length) > MAX_VOICE_BYTES:
+                raise HTTPException(status_code=413, detail="音频文件不能超过 50 MiB")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="无效的 Content-Length") from None
+    content = bytearray()
+    async for chunk in request.stream():
+        content.extend(chunk)
+        if len(content) > MAX_VOICE_BYTES:
+            raise HTTPException(status_code=413, detail="音频文件不能超过 50 MiB")
+    return bytes(content)
+
+
+@app.get("/admin/custom-voices")
+def admin_custom_voices(request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin(request, session)
+    welcome_voice_id = _get_welcome_voice_id(session)
+    rows = session.execute(select(CustomVoice).order_by(CustomVoice.id.asc())).scalars().all()
+    return {"voices": [_custom_voice_payload(row, welcome_voice_id=welcome_voice_id) for row in rows]}
+
+
+@app.put("/admin/custom-voices/{voice_id}")
+async def admin_upload_custom_voice(
+    voice_id: int,
+    request: Request,
+    command: str,
+    label: str = "",
+    session: Session = Depends(get_session),
+) -> dict:
+    _, admin_session = require_admin(request, session)
+    require_csrf(request, admin_session)
+    try:
+        normalized_command = _normalize_custom_voice_command(command)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    row = session.get(CustomVoice, voice_id) if voice_id > 0 else None
+    duplicate = session.execute(
+        select(CustomVoice).where(CustomVoice.command == normalized_command).limit(1)
+    ).scalars().first()
+    if duplicate is not None and duplicate is not row:
+        raise HTTPException(status_code=409, detail="该内置语音指令已存在")
+
+    content = await _read_custom_voice_upload(request)
+    filename = request.headers.get("x-file-name", "custom-voice.audio")
+    content_type = request.headers.get("content-type", "")
+    try:
+        stored_path, _stored_name = save_voice_audio(
+            content,
+            filename=filename,
+            content_type=content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.error("无法保存内置语音文件: %s", exc)
+        raise HTTPException(status_code=500, detail="无法保存内置语音文件，请检查数据目录权限") from exc
+
+    old_path = row.stored_path if row is not None else ""
+    if row is None:
+        row = CustomVoice(
+            command=normalized_command,
+            label=(label or normalized_command).strip()[:255],
+            stored_path=stored_path,
+            original_filename=filename[:255],
+            media_type=content_type[:128],
+            size_bytes=len(content),
+        )
+        session.add(row)
+    else:
+        row.command = normalized_command
+        row.label = (label or normalized_command).strip()[:255]
+        row.stored_path = stored_path
+        row.original_filename = filename[:255]
+        row.media_type = content_type[:128]
+        row.size_bytes = len(content)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        delete_voice_audio(stored_path)
+        raise
+    if old_path and old_path != stored_path:
+        delete_voice_audio(old_path)
+    return {"ok": True, "voice": _custom_voice_payload(row, welcome_voice_id=_get_welcome_voice_id(session))}
+
+
+@app.put("/admin/custom-voices/{voice_id}/welcome")
+def admin_set_welcome_voice(
+    voice_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    _, admin_session = require_admin(request, session)
+    require_csrf(request, admin_session)
+    if voice_id > 0 and session.get(CustomVoice, voice_id) is None:
+        raise HTTPException(status_code=404, detail="内置语音不存在")
+    _set_welcome_voice_id(session, voice_id if voice_id > 0 else None)
+    session.commit()
+    return {"ok": True, "welcome_voice_id": voice_id if voice_id > 0 else None}
+
+
+@app.put("/admin/custom-voices/{voice_id}/enabled")
+def admin_set_custom_voice_enabled(
+    voice_id: int,
+    enabled: bool,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    _, admin_session = require_admin(request, session)
+    require_csrf(request, admin_session)
+    row = session.get(CustomVoice, voice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="内置语音不存在")
+    _set_custom_voice_enabled(session, voice_id, bool(enabled))
+    session.commit()
+    return {"ok": True, "voice": _custom_voice_payload(row, welcome_voice_id=_get_welcome_voice_id(session))}
+
+
+@app.delete("/admin/custom-voices/{voice_id}")
+def admin_delete_custom_voice(
+    voice_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    _, admin_session = require_admin(request, session)
+    require_csrf(request, admin_session)
+    row = session.get(CustomVoice, voice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="内置语音不存在")
+    stored_path = row.stored_path
+    if _get_welcome_voice_id(session) == voice_id:
+        _set_welcome_voice_id(session, None)
+    session.delete(row)
+    session.commit()
+    delete_voice_audio(stored_path)
+    return {"ok": True, "voice_id": voice_id}
 
 
 @app.put("/admin/assets/{asset_key}")
@@ -5341,6 +6315,32 @@ async def netease_playlist_detail(playlist_id: str) -> dict:
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/netease/playlist/resolve")
+async def netease_playlist_resolve(value: str) -> dict:
+    """Resolve a numeric ID or standard Netease playlist URL for the web UI."""
+    playlist_id = _try_parse_netease_playlist_id(value)
+    if not playlist_id:
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持网易云数字歌单 ID 或 music.163.com 歌单链接",
+        )
+    try:
+        cookie = _get_admin_cookie_or_none()
+        detail = await netease.playlist_detail(playlist_id, cookie=cookie)
+        playlist_name, tracks = await _load_netease_playlist_tracks(detail, cookie=cookie)
+        raw_playlist = (detail or {}).get("playlist") or {}
+        if not isinstance(raw_playlist, dict):
+            raise HTTPException(status_code=502, detail="网易云返回的歌单数据无效")
+        playlist = dict(raw_playlist)
+        playlist["tracks"] = tracks
+        playlist["name"] = playlist_name or str(playlist.get("name") or playlist_id)
+        return {"playlist_id": playlist_id, "playlist": playlist}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"网易云歌单查询失败: {e}")
 
 
 @app.get("/netease/song/{song_id}/lyric")
