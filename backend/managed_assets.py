@@ -52,7 +52,7 @@ ASSETS: tuple[ManagedAsset, ...] = (
         filename="web-app-icon",
         public_path="/assets/web-app-icon",
         allow_ico=True,
-        help="用于浏览器标签页图标，固定保存到 data/uploads/web-app-icon。",
+        help="用于浏览器标签页图标，固定保存到运行数据目录的 uploads/web-app-icon。",
     ),
     ManagedAsset(
         key="teamspeak-avatar",
@@ -61,7 +61,7 @@ ASSETS: tuple[ManagedAsset, ...] = (
         filename="teamspeak-avatar",
         public_path="/assets/teamspeak-avatar",
         restart="voice",
-        help="用于 TeamSpeak 客户端头像，固定保存到 data/uploads/teamspeak-avatar；上传时会自动压缩到服务器常用限制以内。",
+        help="用于 TeamSpeak 客户端头像，固定保存到运行数据目录的 uploads/teamspeak-avatar；上传时会自动压缩到服务器常用限制以内。",
     ),
 )
 
@@ -73,10 +73,17 @@ def asset_path(asset: ManagedAsset) -> Path:
 
 
 def voice_avatar_config_path() -> str:
-    # Keep the shared voice config portable. voice-service resolves repository
-    # relative paths at runtime, so the config never contains this machine's
-    # absolute checkout path.
-    return "./data/uploads/teamspeak-avatar"
+    # Keep the shared voice config portable while pointing at the same path
+    # used by save_asset(). The default directory depends on the database
+    # location, so a hard-coded data/uploads path can point at an old image.
+    path = asset_path(ASSET_BY_KEY["teamspeak-avatar"])
+    try:
+        relative = path.relative_to(REPO_ROOT)
+    except ValueError:
+        # An explicitly configured external asset directory may be outside
+        # the repository; preserve it rather than silently selecting another file.
+        return str(path)
+    return f"./{relative.as_posix()}"
 
 
 def detect_image_type(data: bytes) -> str | None:

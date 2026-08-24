@@ -311,6 +311,63 @@ class TsChatCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TsLyricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ts_lyrics_command_can_interrupt_while_playing(self) -> None:
+        with (
+            patch.object(main, "update_settings") as update,
+            patch.object(main, "_schedule_ts_lyrics_update") as schedule,
+            patch.object(
+                main.voice,
+                "get_status",
+                AsyncMock(return_value=SimpleNamespace(
+                    state="STATE_PLAYING",
+                    now_playing_title="测试歌曲",
+                )),
+            ) as status,
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Alice", "歌词 中断")
+
+        update.assert_called_once_with(
+            unittest.mock.ANY,
+            {"voice.ts_lyrics_enabled": False},
+            apply=True,
+        )
+        schedule.assert_called_once_with(None)
+        status.assert_awaited_once_with()
+        self.assertIn("歌词已中断", notice.await_args.args[0])
+        self.assertIn("当前正在播放：测试歌曲", notice.await_args.args[0])
+
+    async def test_ts_lyrics_command_can_resume_when_stopped(self) -> None:
+        with (
+            patch.object(main, "update_settings") as update,
+            patch.object(main, "_reschedule_ts_lyrics_from_current", AsyncMock()) as reschedule,
+            patch.object(
+                main.voice,
+                "get_status",
+                AsyncMock(return_value=SimpleNamespace(
+                    state="STATE_IDLE",
+                    now_playing_title="",
+                )),
+            ),
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Bob", "!歌词 播放")
+
+        update.assert_called_once_with(
+            unittest.mock.ANY,
+            {"voice.ts_lyrics_enabled": True},
+            apply=True,
+        )
+        reschedule.assert_awaited_once_with()
+        self.assertIn("歌词已开启", notice.await_args.args[0])
+        self.assertIn("当前没有正在播放的歌曲", notice.await_args.args[0])
+
+    async def test_ts_lyrics_command_reports_usage_for_unknown_action(self) -> None:
+        with patch.object(main.voice, "send_notice", AsyncMock()) as notice:
+            await main._handle_chat_command("Alice", "歌词 状态")
+
+        self.assertEqual("用法: 歌词 播放 / 歌词 中断", notice.await_args.args[0])
+
     async def test_setting_now_playing_starts_and_clearing_it_cancels_lyrics_generation(self) -> None:
         with (
             patch.object(main, "_schedule_ts_description_update"),
@@ -748,6 +805,14 @@ class TsLyricsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CustomVoiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_custom_voice_gain_uses_independent_runtime_volume(self) -> None:
+        with patch.object(main, "_runtime_int", return_value=180):
+            self.assertEqual(1.8, main._custom_voice_gain())
+        with patch.object(main, "_runtime_int", return_value=999):
+            self.assertEqual(3.0, main._custom_voice_gain())
+        with patch.object(main, "_runtime_int", return_value=-10):
+            self.assertEqual(0.0, main._custom_voice_gain())
+
     def test_custom_voice_command_rejects_builtins_and_spaces(self) -> None:
         self.assertEqual("鼓掌", main._normalize_custom_voice_command("!鼓掌"))
         with self.assertRaises(ValueError):
@@ -768,6 +833,7 @@ class CustomVoiceTests(unittest.IsolatedAsyncioTestCase):
             row = SimpleNamespace(stored_path=str(audio), label="欢迎语", command="欢迎")
             with (
                 patch.object(main, "_find_custom_voice", return_value=row),
+                patch.object(main, "_custom_voice_gain", return_value=1.5),
                 patch.object(main.voice, "get_status", AsyncMock(return_value=SimpleNamespace(state="STATE_PLAYING"))),
                 patch.object(main.voice, "play_overlay", AsyncMock(return_value=True)) as overlay,
             ):
@@ -779,6 +845,7 @@ class CustomVoiceTests(unittest.IsolatedAsyncioTestCase):
             title="欢迎语",
             requested_by="Alice",
             duck_db=12.0,
+            voice_gain=1.5,
         )
 
     async def test_custom_voice_plays_directly_when_music_is_idle(self) -> None:
@@ -788,13 +855,20 @@ class CustomVoiceTests(unittest.IsolatedAsyncioTestCase):
             row = SimpleNamespace(stored_path=str(audio), label="提示音", command="提示")
             with (
                 patch.object(main, "_find_custom_voice", return_value=row),
+                patch.object(main, "_custom_voice_gain", return_value=1.5),
                 patch.object(main.voice, "get_status", AsyncMock(return_value=SimpleNamespace(state="STATE_IDLE"))),
                 patch.object(main.voice, "play", AsyncMock()) as play,
             ):
                 result = await main._trigger_custom_voice("提示", invoker_name="Bob")
 
         self.assertIn("正在播放内置语音", result)
-        play.assert_awaited_once_with(source_url=str(audio), title="提示音", requested_by="Bob")
+        play.assert_awaited_once_with(
+            source_url=str(audio),
+            title="提示音",
+            requested_by="Bob",
+            voice_gain=1.5,
+            independent_volume=True,
+        )
 
     async def test_disabled_custom_voice_is_not_played(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -835,6 +909,31 @@ class CustomVoiceTests(unittest.IsolatedAsyncioTestCase):
             session.close()
             engine.dispose()
 
+    def test_custom_voice_volume_setting_is_per_voice_and_clamped(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        try:
+            first = CustomVoice(command="提示", label="提示音", stored_path="/tmp/prompt.wav")
+            second = CustomVoice(command="欢迎", label="欢迎音", stored_path="/tmp/welcome.wav")
+            session.add_all([first, second])
+            session.commit()
+
+            with patch.object(main, "_runtime_int", return_value=150):
+                self.assertEqual(150, main._custom_voice_volume_percent(first, session=session))
+            main._set_custom_voice_volume(session, first.id, 240)
+            main._set_custom_voice_volume(session, second.id, -20)
+            session.commit()
+
+            self.assertEqual(240, main._custom_voice_volume_percent(first, session=session))
+            self.assertEqual(0, main._custom_voice_volume_percent(second, session=session))
+            self.assertEqual("240", session.get(AppSetting, main._custom_voice_volume_setting_key(first.id)).value)
+            with patch.object(main, "_custom_voice_volume_percent", return_value=240):
+                self.assertEqual(2.4, main._custom_voice_gain(first))
+        finally:
+            session.close()
+            engine.dispose()
+
     async def test_ordinary_user_can_trigger_custom_voice_from_ts_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             audio = Path(tmp) / "clap.ogg"
@@ -856,7 +955,8 @@ class WelcomeVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(main._welcome_event_matches_target(channel_id=123, bot_channel_id=123, target_channel_id="123"))
         self.assertFalse(main._welcome_event_matches_target(channel_id=456, bot_channel_id=123, target_channel_id="123"))
         self.assertFalse(main._welcome_event_matches_target(channel_id=123, bot_channel_id=456, target_channel_id="123"))
-        self.assertFalse(main._welcome_event_matches_target(channel_id=123, bot_channel_id=123, target_channel_id=""))
+        self.assertTrue(main._welcome_event_matches_target(channel_id=123, bot_channel_id=123, target_channel_id=""))
+        self.assertFalse(main._welcome_event_matches_target(channel_id=0, bot_channel_id=0, target_channel_id=""))
 
     def test_welcome_voice_has_global_and_per_user_cooldowns(self) -> None:
         with patch.object(main, "_runtime_int", return_value=10):
@@ -990,6 +1090,27 @@ class DynamicNeteaseProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([True, False], [call.args[0] for call in shuffle.await_args_list])
         self.assertIn("已切换为随机播放", notice.await_args_list[0].args[0])
         self.assertIn("已切换为顺序播放", notice.await_args_list[1].args[0])
+
+    async def test_repeat_commands_switch_list_single_and_off_modes(self) -> None:
+        previous_mode = main._repeat_mode
+        try:
+            with (
+                patch.object(main, "_schedule_ts_description_update"),
+                patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+            ):
+                await main._handle_chat_command("Carol", "循环 列表")
+                self.assertEqual("all", main._repeat_mode)
+                self.assertIn("已切换为列表循环", notice.await_args_list[-1].args[0])
+
+                await main._handle_chat_command("Carol", "循环 单曲")
+                self.assertEqual("one", main._repeat_mode)
+                self.assertIn("已切换为单曲循环", notice.await_args_list[-1].args[0])
+
+                await main._handle_chat_command("Carol", "循环 关闭")
+                self.assertEqual("none", main._repeat_mode)
+                self.assertIn("已切换为关闭循环", notice.await_args_list[-1].args[0])
+        finally:
+            main._repeat_mode = previous_mode
 
     async def test_clear_command_clears_queue_and_playback_state(self) -> None:
         count_result = unittest.mock.Mock()

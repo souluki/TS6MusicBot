@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +40,6 @@ use tsbot::voice::v1 as voicev1;
 use voicev1::voice_service_server::{VoiceService, VoiceServiceServer};
 
 static DIRECT_DESCRIPTION_UPDATE_WARNED: AtomicBool = AtomicBool::new(false);
-static CONFIG_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 struct SharedStatus {
@@ -173,6 +172,7 @@ struct OverlayControl {
     queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     active: Arc<AtomicBool>,
     duck_db: f32,
+    voice_gain: f32,
 }
 
 struct AvatarUploadState {
@@ -359,7 +359,15 @@ impl VoiceService for VoiceServiceImpl {
         req: Request<voicev1::PlayRequest>,
     ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
         let r = req.into_inner();
-        self.start_playback_internal(r.title, r.source_url, r.notice, 0.0, false)
+        self.start_playback_internal(
+            r.title,
+            r.source_url,
+            r.notice,
+            0.0,
+            false,
+            r.voice_gain,
+            r.independent_volume,
+        )
             .await?;
 
         Ok(Response::new(voicev1::CommandResponse {
@@ -379,7 +387,7 @@ impl VoiceService for VoiceServiceImpl {
                 message: "no active playback".to_string(),
             }));
         }
-        self.start_overlay_internal(r.source_url, r.duck_db).await?;
+        self.start_overlay_internal(r.source_url, r.duck_db, r.voice_gain).await?;
         Ok(Response::new(voicev1::CommandResponse {
             ok: true,
             message: "overlay accepted".to_string(),
@@ -601,7 +609,15 @@ impl VoiceService for VoiceServiceImpl {
             }
         };
 
-        self.start_playback_internal(title, source_url, String::new(), target_time_s, paused)
+        self.start_playback_internal(
+            title,
+            source_url,
+            String::new(),
+            target_time_s,
+            paused,
+            1.0,
+            false,
+        )
             .await?;
 
         Ok(Response::new(voicev1::CommandResponse {
@@ -794,6 +810,8 @@ impl VoiceServiceImpl {
         notice: String,
         start_time_s: f64,
         paused: bool,
+        voice_gain: f32,
+        independent_volume: bool,
     ) -> std::result::Result<(), Status> {
         if !notice.is_empty() {
             let _ = self.ts3_notice_tx.try_send((2, notice));
@@ -813,6 +831,7 @@ impl VoiceServiceImpl {
         let cancel = CancellationToken::new();
 
         let status = self.status.clone();
+        let task_status = status.clone();
         let tx = self.ts3_audio_tx.clone();
         let events_tx = self.events_tx.clone();
         let title_for_event = title.clone();
@@ -821,6 +840,11 @@ impl VoiceServiceImpl {
         let overlay = self.overlay.clone();
         let loop_events_tx = events_tx.clone();
         let loop_title = title_for_event.clone();
+        let voice_gain = if voice_gain.is_finite() {
+            voice_gain.clamp(0.0, 3.0)
+        } else {
+            1.0
+        };
 
         let handle = tokio::spawn(async move {
             let r = playback_loop(
@@ -833,11 +857,19 @@ impl VoiceServiceImpl {
                 overlay,
                 loop_events_tx,
                 loop_title,
+                voice_gain,
+                independent_volume,
             )
             .await;
             let was_cancelled = cancel_for_task.is_cancelled();
             match r {
                 Ok(()) => {
+                    let mut st = task_status.lock().await;
+                    if st.now_playing_source_url == source_url_for_loop {
+                        st.state = 1; // STATE_IDLE
+                        st.now_playing_title.clear();
+                        st.now_playing_source_url.clear();
+                    }
                     if !was_cancelled {
                         // PlaybackEvent.Type: FINISHED=2
                         emit_playback(&events_tx, 2, title_for_event, source_url_for_loop, "");
@@ -846,6 +878,12 @@ impl VoiceServiceImpl {
                 Err(e) => {
                     if was_cancelled {
                         return;
+                    }
+                    let mut st = task_status.lock().await;
+                    if st.now_playing_source_url == source_url_for_loop {
+                        st.state = 1; // STATE_IDLE
+                        st.now_playing_title.clear();
+                        st.now_playing_source_url.clear();
                     }
                     error!(%e, "playback loop failed");
                     // PlaybackEvent.Type: ERROR=3
@@ -863,7 +901,12 @@ impl VoiceServiceImpl {
         Ok(())
     }
 
-    async fn start_overlay_internal(&self, source_url: String, duck_db: f32) -> std::result::Result<(), Status> {
+    async fn start_overlay_internal(
+        &self,
+        source_url: String,
+        duck_db: f32,
+        voice_gain: f32,
+    ) -> std::result::Result<(), Status> {
         self.stop_overlay_internal().await;
 
         let frame_bytes = (48000 / 50) * 2 * 2;
@@ -878,7 +921,15 @@ impl VoiceServiceImpl {
         let handle = tokio::spawn(async move {
             let is_network_input = source_url.starts_with("http://") || source_url.starts_with("https://");
             let mut command = tokio::process::Command::new(ffmpeg_program());
-            command.arg("-nostdin").arg("-loglevel").arg("error");
+            // Overlay audio must be decoded in real time. Without `-re`,
+            // FFmpeg reads local voice files as fast as possible, the bounded
+            // queue drops the oldest frames, and playback starts near the end
+            // of the welcome audio.
+            command
+                .arg("-nostdin")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-re");
             if is_network_input {
                 command
                     .arg("-reconnect")
@@ -937,6 +988,7 @@ impl VoiceServiceImpl {
             queue,
             active,
             duck_db: if duck_db.is_finite() { duck_db.clamp(0.0, 30.0) } else { 12.0 },
+            voice_gain: if voice_gain.is_finite() { voice_gain.clamp(0.0, 3.0) } else { 1.0 },
         });
         Ok(())
     }
@@ -1241,86 +1293,82 @@ async fn ts3_actor(
     mut cmd_rx: mpsc::Receiver<OutCommand>,
     mut nickname_rx: mpsc::Receiver<NicknameUpdateRequest>,
     mut avatar_rx: mpsc::Receiver<PathBuf>,
+    mut config_reload_rx: mpsc::Receiver<()>,
     events_tx: broadcast::Sender<voicev1::Event>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    let host = get_env("TSBOT_TS3_HOST", "127.0.0.1");
-    let port = get_env("TSBOT_TS3_PORT", "9987");
-    let port = port.trim_start_matches(':').to_string();
-    let nickname = get_env("TSBOT_TS3_NICKNAME", "tsbot");
-    let server_password = get_env("TSBOT_TS3_SERVER_PASSWORD", "");
-    let channel_password = get_env("TSBOT_TS3_CHANNEL_PASSWORD", "");
-    let channel_path = get_env("TSBOT_TS3_CHANNEL_PATH", "");
-    let channel_id = get_env("TSBOT_TS3_CHANNEL_ID", "");
-    let identity_str = get_env("TSBOT_TS3_IDENTITY", "");
-    let identity_file = resolve_repo_relative(&get_env("TSBOT_TS3_IDENTITY_FILE", "./logs/identity.json"));
-    let avatar_path = resolve_avatar_path_from_env();
+    let build_options = || {
+        let host = get_env("TSBOT_TS3_HOST", "127.0.0.1");
+        let port = get_env("TSBOT_TS3_PORT", "9987");
+        let port = port.trim_start_matches(':').to_string();
+        let nickname = get_env("TSBOT_TS3_NICKNAME", "tsbot");
+        let server_password = get_env("TSBOT_TS3_SERVER_PASSWORD", "");
+        let channel_password = get_env("TSBOT_TS3_CHANNEL_PASSWORD", "");
+        let channel_path = get_env("TSBOT_TS3_CHANNEL_PATH", "");
+        let channel_id = get_env("TSBOT_TS3_CHANNEL_ID", "");
+        let identity_str = get_env("TSBOT_TS3_IDENTITY", "");
+        let identity_file = resolve_repo_relative(&get_env("TSBOT_TS3_IDENTITY_FILE", "./logs/identity.json"));
+        let address = format!("{}:{}", host, port);
 
-    let address = format!("{}:{}", host, port);
+        let client_version = Version::Custom {
+            platform: "Windows".to_string(),
+            version: "3.6.2 [Build: 1695203293]".to_string(),
+            signature: vec![224, 23, 90, 102, 151, 96, 81, 35, 2, 184, 139, 60, 169, 201, 104, 36, 243, 113, 54, 82, 120, 163, 180, 10, 159, 19, 2, 68, 238, 180, 153, 35, 147, 180, 150, 114, 42, 51, 171, 24, 176, 38, 120, 1, 45, 44, 130, 99, 114, 57, 157, 74, 156, 156, 49, 180, 14, 33, 95, 118, 43, 107, 215, 3],
+        };
 
-    let client_version = Version::Custom {
-        platform: "Windows".to_string(),
-        version: "3.6.2 [Build: 1695203293]".to_string(),
-        signature: vec![224, 23, 90, 102, 151, 96, 81, 35, 2, 184, 139, 60, 169, 201, 104, 36, 243, 113, 54, 82, 120, 163, 180, 10, 159, 19, 2, 68, 238, 180, 153, 35, 147, 180, 150, 114, 42, 51, 171, 24, 176, 38, 120, 1, 45, 44, 130, 99, 114, 57, 157, 74, 156, 156, 49, 180, 14, 33, 95, 118, 43, 107, 215, 3],
-    };
+        let mut opts = Connection::build(address)
+            .name(nickname)
+            .version(client_version)
+            .input_muted(false)
+            .output_muted(false)
+            .input_hardware_enabled(true)
+            .output_hardware_enabled(true)
+            .log_commands(false);
 
-    let mut opts = Connection::build(address)
-        .name(nickname)
-        .version(client_version)
-        .input_muted(false)
-        .output_muted(false)
-        .input_hardware_enabled(true)
-        .output_hardware_enabled(true)
-        .log_commands(false);
-
-    if !server_password.is_empty() {
-        opts = opts.password(server_password);
-    }
-
-    if !channel_password.is_empty() {
-        opts = opts.channel_password(channel_password);
-    }
-
-    if !channel_id.is_empty() {
-        if let Ok(id) = channel_id.parse::<u64>() {
-            opts = opts.channel_id(tsclientlib::ChannelId(id));
+        if !server_password.is_empty() {
+            opts = opts.password(server_password);
         }
-    } else if !channel_path.is_empty() {
-        opts = opts.channel(channel_path);
-    }
-
-    if !identity_str.is_empty() {
-        if let Ok(id) = Identity::new_from_str(&identity_str) {
-            opts = opts.identity(id);
+        if !channel_password.is_empty() {
+            opts = opts.channel_password(channel_password);
         }
-    } else {
-        let mut ident: Option<Identity> = None;
+        if !channel_id.is_empty() {
+            if let Ok(id) = channel_id.parse::<u64>() {
+                opts = opts.channel_id(tsclientlib::ChannelId(id));
+            }
+        } else if !channel_path.is_empty() {
+            opts = opts.channel(channel_path);
+        }
 
-        if let Ok(s) = fs::read_to_string(&identity_file) {
-            let s = s.trim();
-            if !s.is_empty() {
-                // Prefer JSON-serialized identity for stability.
-                if let Ok(id) = serde_json::from_str::<Identity>(s) {
-                    ident = Some(id);
-                } else if let Ok(id) = Identity::new_from_str(s) {
-                    ident = Some(id);
+        if !identity_str.is_empty() {
+            if let Ok(id) = Identity::new_from_str(&identity_str) {
+                opts = opts.identity(id);
+            }
+        } else {
+            let mut ident: Option<Identity> = None;
+            if let Ok(s) = fs::read_to_string(&identity_file) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    if let Ok(id) = serde_json::from_str::<Identity>(s) {
+                        ident = Some(id);
+                    } else if let Ok(id) = Identity::new_from_str(s) {
+                        ident = Some(id);
+                    }
                 }
             }
-        }
-
-        if ident.is_none() {
-            if let Some(parent) = identity_file.parent() {
-                let _ = fs::create_dir_all(parent);
+            if ident.is_none() {
+                if let Some(parent) = identity_file.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let id = Identity::create();
+                let _ = fs::write(&identity_file, serde_json::to_string(&id).unwrap_or_default());
+                ident = Some(id);
             }
-            let id = Identity::create();
-            let _ = fs::write(&identity_file, serde_json::to_string(&id).unwrap_or_default());
-            ident = Some(id);
+            if let Some(id) = ident {
+                opts = opts.identity(id);
+            }
         }
-
-        if let Some(id) = ident {
-            opts = opts.identity(id);
-        }
-    }
+        opts
+    };
 
     let mut out_buf: VecDeque<OutPacket> = VecDeque::with_capacity(400);
     let mut pending_notices: VecDeque<(i32, String)> = VecDeque::new();
@@ -1333,6 +1381,9 @@ async fn ts3_actor(
         if shutdown_token.is_cancelled() {
             break;
         }
+
+        let opts = build_options();
+        let avatar_path = resolve_avatar_path_from_env();
 
         let mut connect_handle = tokio::task::spawn_blocking({
             let o = opts.clone();
@@ -1483,6 +1534,20 @@ async fn ts3_actor(
                         let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
                     }
                     conn_err = None;
+                    break 'inner;
+                }
+
+                reload = config_reload_rx.recv() => {
+                    if reload.is_none() {
+                        break 'outer;
+                    }
+                    emit_log(&events_tx, 2, "voice configuration changed; reconnecting with updated settings");
+                    // The configured avatar may have changed while the TS
+                    // connection is still alive.  A reconnect must therefore
+                    // re-run the initial avatar upload; otherwise the stale
+                    // `avatar_set_done` flag makes the new image get skipped.
+                    avatar_set_done = false;
+                    conn_err = Some("voice configuration changed".to_string());
                     break 'inner;
                 }
 
@@ -1996,6 +2061,8 @@ async fn playback_loop(
     overlay: Arc<Mutex<Option<OverlayControl>>>,
     events_tx: broadcast::Sender<voicev1::Event>,
     title: String,
+    voice_gain: f32,
+    independent_volume: bool,
 ) -> Result<()> {
     let playback_started = Instant::now();
     let start_time_s = if start_time_s.is_finite() {
@@ -2246,15 +2313,16 @@ async fn playback_loop(
             info!(underruns_total = %underruns_total, "playback underrun (sending silence frames to keep cadence)");
         }
 
-        let (overlay_frame, overlay_active, overlay_duck_db) = {
+        let (overlay_frame, overlay_active, overlay_duck_db, overlay_voice_gain) = {
             let slot = overlay.lock().await;
             if let Some(control) = slot.as_ref() {
                 let active = control.active.load(Ordering::Relaxed);
                 let duck_db = control.duck_db;
+                let voice_gain = control.voice_gain;
                 let frame = control.queue.lock().await.pop_front();
-                (frame, active, duck_db)
+                (frame, active, duck_db, voice_gain)
             } else {
-                (None, false, 12.0)
+                (None, false, 12.0, 1.0)
             }
         };
         let overlay_present = overlay_frame.is_some();
@@ -2282,8 +2350,17 @@ async fn playback_loop(
 
         let (vol, fx_pan, fx_width, fx_swap_lr, fx_bass_db, fx_reverb_mix) = {
             let st = status.lock().await;
-            let r = (st.volume_percent as f32 / 100.0).clamp(0.0, 2.0);
-            let vol = if r <= 1.0 { r.powf(1.6) } else { r };
+            let music_ratio = (st.volume_percent as f32 / 100.0).clamp(0.0, 2.0);
+            let music_volume = if music_ratio <= 1.0 {
+                music_ratio.powf(1.6)
+            } else {
+                music_ratio
+            };
+            let vol = if independent_volume {
+                voice_gain.clamp(0.0, 3.0)
+            } else {
+                music_volume
+            };
             (
                 vol,
                 st.fx_pan.clamp(-1.0, 1.0),
@@ -2317,7 +2394,7 @@ async fn playback_loop(
 
         if overlay_is_active || (duck_gain - 1.0).abs() > 0.001 {
             for i in 0..(frame_samples_per_channel * channels) {
-                float_buf[i] = float_buf[i] * duck_gain + overlay_float_buf[i];
+                float_buf[i] = float_buf[i] * duck_gain + overlay_float_buf[i] * overlay_voice_gain;
             }
         }
 
@@ -2473,6 +2550,7 @@ async fn main() -> Result<()> {
     let (ts3_cmd_tx, ts3_cmd_rx) = mpsc::channel::<OutCommand>(50);
     let (ts3_nickname_tx, ts3_nickname_rx) = mpsc::channel::<NicknameUpdateRequest>(20);
     let (ts3_avatar_tx, ts3_avatar_rx) = mpsc::channel::<PathBuf>(10);
+    let (config_reload_tx, config_reload_rx) = mpsc::channel::<()>(4);
 
     let (events_tx, _events_rx) = broadcast::channel::<voicev1::Event>(512);
 
@@ -2488,9 +2566,10 @@ async fn main() -> Result<()> {
 
     {
         let shutdown_token = shutdown_token.clone();
+        let config_reload_tx = config_reload_tx.clone();
         let config_path = voice_config_path();
         tokio::spawn(async move {
-            let baseline = initial_config;
+            let mut baseline = initial_config;
             loop {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 if shutdown_token.is_cancelled() {
@@ -2498,10 +2577,12 @@ async fn main() -> Result<()> {
                 }
                 let current = fs::read(&config_path).unwrap_or_default();
                 if current != baseline {
-                    info!(path = %config_path.display(), "voice configuration changed; restarting service");
-                    CONFIG_RESTART_REQUESTED.store(true, Ordering::SeqCst);
-                    shutdown_token.cancel();
-                    return;
+                    info!(path = %config_path.display(), "voice configuration changed; requesting TS reconnect");
+                    baseline = current;
+                    let _ = load_voice_config();
+                    if config_reload_tx.send(()).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -2511,7 +2592,16 @@ async fn main() -> Result<()> {
         let events_tx_clone = events_tx.clone();
         let shutdown_token_clone = shutdown_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = ts3_actor(ts3_audio_rx, ts3_notice_rx, ts3_cmd_rx, ts3_nickname_rx, ts3_avatar_rx, events_tx_clone, shutdown_token_clone).await {
+            if let Err(e) = ts3_actor(
+                ts3_audio_rx,
+                ts3_notice_rx,
+                ts3_cmd_rx,
+                ts3_nickname_rx,
+                ts3_avatar_rx,
+                config_reload_rx,
+                events_tx_clone,
+                shutdown_token_clone,
+            ).await {
                 error!(%e, "ts3 actor exited");
             }
         })
@@ -2635,20 +2725,5 @@ async fn main() -> Result<()> {
     }
 
     info!("Voice service shutdown complete");
-    if CONFIG_RESTART_REQUESTED.load(Ordering::SeqCst) {
-        let executable = env::current_exe()?;
-        let args: Vec<String> = env::args().skip(1).collect();
-        info!("Starting voice-service again with the updated configuration");
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            let error = Command::new(executable).args(args).exec();
-            return Err(anyhow!("failed to restart voice-service: {error}"));
-        }
-        #[cfg(not(unix))]
-        {
-            Command::new(executable).args(args).spawn()?;
-        }
-    }
     Ok(())
 }

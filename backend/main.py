@@ -2782,15 +2782,23 @@ class RepeatRequest(BaseModel):
     mode: str  # "none", "all", "one"
 
 
+def _normalize_repeat_mode(value: str) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"none", "off", "0", "false", "关", "关闭", "不循环"}:
+        return "none"
+    if normalized in {"all", "list", "列表", "列表循环", "循环列表", "开启", "开", "on", "1", "true"}:
+        return "all"
+    if normalized in {"one", "single", "song", "单曲", "单曲循环"}:
+        return "one"
+    return None
+
+
 @app.post("/voice/repeat")
 async def voice_repeat(req: RepeatRequest) -> dict:
     global _repeat_mode
-    
-    if req.mode in ["none", "all", "one"]:
-        _repeat_mode = req.mode
-    else:
-        _repeat_mode = "none"
-    
+
+    _repeat_mode = _normalize_repeat_mode(req.mode) or "none"
+
     _schedule_ts_description_update()
     return {"ok": True, "mode": _repeat_mode}
 
@@ -3340,8 +3348,10 @@ def _format_help() -> str:
         "歌单ID <id|Netease URL> - add a Netease playlist directly to the queue\n"
         "清空|clear - clear the current queue\n"
         "顺序播放|order / 随机播放|random - switch queue playback mode\n"
+        "循环|repeat <列表|单曲|关闭> - set list repeat, single repeat, or turn repeat off\n"
         "暂停|pause / 恢复|resume / 停止|stop / 跳过|skip\n"
         "音量|vol <0-200> - set volume\n"
+        "歌词 播放 / 歌词 中断 - toggle current-channel lyrics\n"
         "音效|fx - show audio fx\n"
         "fx pan <-1..1> / fx width <0..3> / fx swap <on|off> / fx bass <0..18> / fx reverb <0..1> / fx reset"
     )
@@ -3553,6 +3563,46 @@ def _runtime_int(key: str, default: int) -> int:
         session.close()
 
 
+def _custom_voice_volume_setting_key(voice_id: int) -> str:
+    return f"voice.custom_voice.{int(voice_id)}.volume"
+
+
+def _custom_voice_volume_percent(
+    row: CustomVoice,
+    *,
+    session: Session | None = None,
+) -> int:
+    """Return one custom voice's volume, falling back to the legacy global value."""
+    voice_id = int(getattr(row, "id", 0) or 0)
+    fallback = _runtime_int("voice.custom_voice_volume", 150)
+    if voice_id <= 0:
+        return max(0, min(300, fallback))
+
+    owns_session = session is None
+    active_session = session or new_session()
+    try:
+        setting = active_session.get(AppSetting, _custom_voice_volume_setting_key(voice_id))
+        if setting is None:
+            return max(0, min(300, fallback))
+        try:
+            value = int(setting.value)
+        except (TypeError, ValueError):
+            value = fallback
+        return max(0, min(300, value))
+    finally:
+        if owns_session:
+            active_session.close()
+
+
+def _custom_voice_gain(row: CustomVoice | None = None) -> float:
+    """Return a custom voice gain independent from the music volume."""
+    if row is None:
+        volume_percent = _runtime_int("voice.custom_voice_volume", 150)
+    else:
+        volume_percent = _custom_voice_volume_percent(row)
+    return max(0.0, min(3.0, volume_percent / 100.0))
+
+
 def _truncate_ts_nickname(value: str) -> str:
     text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
     return text[:64].strip()
@@ -3746,6 +3796,38 @@ async def _reschedule_ts_lyrics_from_current() -> None:
     _schedule_ts_lyrics_update(item_id)
 
 
+async def _set_ts_lyrics_from_command(enabled: bool) -> str:
+    session = new_session()
+    try:
+        update_settings(session, {"voice.ts_lyrics_enabled": bool(enabled)}, apply=True)
+    finally:
+        session.close()
+
+    if enabled:
+        await _reschedule_ts_lyrics_from_current()
+    else:
+        _schedule_ts_lyrics_update(None)
+
+    try:
+        status = await voice.get_status()
+        state = str(getattr(status, "state", "") or "").strip().upper()
+        title = str(getattr(status, "now_playing_title", "") or "").strip()
+    except Exception:
+        state = ""
+        title = ""
+
+    if state == "STATE_PLAYING":
+        context = f"当前正在播放：{title}" if title else "当前正在播放歌曲"
+    elif state == "STATE_PAUSED":
+        context = f"当前已暂停：{title}" if title else "当前已暂停播放"
+    else:
+        context = "当前没有正在播放的歌曲"
+
+    if enabled:
+        return f"歌词已开启；{context}。"
+    return f"歌词已中断；{context}。"
+
+
 async def _run_ts_timestamped_lyrics(
     item_id: int,
     generation: int,
@@ -3902,7 +3984,7 @@ _BUILTIN_COMMAND_NAMES = {
     "order", "ordered", "顺序", "顺序播放", "add", "a", "加", "增加", "入队", "点歌", "play", "p", "播放",
     "来一首", "放", "vol", "volume", "音量", "声音", "now", "np", "status", "状态", "当前", "queue", "q",
     "队列", "列表", "pause", "暂停", "resume", "continue", "恢复", "继续", "stop", "停止", "skip", "next",
-    "跳过", "下一首", "切歌", "desc", "简介", "签名", "fx", "音效",
+    "跳过", "下一首", "切歌", "歌词", "lyrics", "desc", "简介", "签名", "fx", "音效",
 }
 
 
@@ -3946,6 +4028,7 @@ def _custom_voice_payload(row: CustomVoice, *, welcome_voice_id: int | None = No
     session = new_session()
     try:
         enabled = _custom_voice_is_enabled(row, session=session)
+        volume_percent = _custom_voice_volume_percent(row, session=session)
     finally:
         session.close()
     return {
@@ -3958,6 +4041,7 @@ def _custom_voice_payload(row: CustomVoice, *, welcome_voice_id: int | None = No
         "created_at": row.created_at.isoformat() if row.created_at else "",
         "is_welcome": welcome_voice_id is not None and int(row.id) == welcome_voice_id,
         "enabled": enabled,
+        "volume_percent": volume_percent,
     }
 
 
@@ -3989,6 +4073,16 @@ def _set_custom_voice_enabled(session: Session, voice_id: int, enabled: bool) ->
         row.value = value
 
 
+def _set_custom_voice_volume(session: Session, voice_id: int, volume_percent: int) -> None:
+    key = _custom_voice_volume_setting_key(voice_id)
+    value = str(max(0, min(300, int(volume_percent))))
+    row = session.get(AppSetting, key)
+    if row is None:
+        session.add(AppSetting(key=key, value=value))
+    else:
+        row.value = value
+
+
 def _find_custom_voice(command: str) -> CustomVoice | None:
     session = new_session()
     try:
@@ -4014,6 +4108,7 @@ async def _trigger_custom_voice_row(row: CustomVoice, *, invoker_name: str) -> s
         return f"内置语音文件不存在：{row.label or row.command}"
 
     title = row.label or row.command
+    voice_gain = _custom_voice_gain(row)
     status = await voice.get_status()
     state = str(getattr(status, "state", "") or "").strip().upper()
     if state == "STATE_PLAYING":
@@ -4022,18 +4117,27 @@ async def _trigger_custom_voice_row(row: CustomVoice, *, invoker_name: str) -> s
             title=title,
             requested_by=invoker_name,
             duck_db=12.0,
+            voice_gain=voice_gain,
         )
         if not accepted:
             return "内置语音混音播放失败，请检查 Voice 服务日志"
         return f"正在播放内置语音：{title}（背景音量降低 12 dB）"
 
-    await voice.play(source_url=str(source_path), title=title, requested_by=invoker_name)
+    await voice.play(
+        source_url=str(source_path),
+        title=title,
+        requested_by=invoker_name,
+        voice_gain=voice_gain,
+        independent_volume=True,
+    )
     return f"正在播放内置语音：{title}"
 
 
 def _welcome_event_matches_target(*, channel_id: int, bot_channel_id: int, target_channel_id: str) -> bool:
     target = str(target_channel_id or "").strip()
-    return bool(target) and str(channel_id) == target and str(bot_channel_id) == target
+    if channel_id <= 0 or bot_channel_id <= 0 or channel_id != bot_channel_id:
+        return False
+    return not target or str(channel_id) == target
 
 
 def _find_welcome_voice() -> CustomVoice | None:
@@ -4440,6 +4544,12 @@ async def _handle_chat_command(
         "顺序": "order",
         "顺序播放": "order",
         "顺序播放列表里的曲目": "order",
+        "repeat": "repeat",
+        "循环": "repeat",
+        "循环播放": "repeat",
+        "列表循环": "repeat",
+        "单曲循环": "repeat",
+        "关闭循环": "repeat",
         "add": "add",
         "a": "add",
         "加": "add",
@@ -4482,6 +4592,8 @@ async def _handle_chat_command(
         "签名": "desc",
         "fx": "fx",
         "音效": "fx",
+        "lyrics": "lyrics",
+        "歌词": "lyrics",
     }
 
     cmd = alias_to_cmd.get(head_norm)
@@ -4512,6 +4624,17 @@ async def _handle_chat_command(
 
         if cmd in ("help", "h"):
             await reply(_format_help())
+            return
+
+        if cmd == "lyrics":
+            action = arg.strip().lower()
+            if action in {"播放", "开启", "开", "on", "enable", "enabled"}:
+                await reply(await _set_ts_lyrics_from_command(True))
+                return
+            if action in {"中断", "停止", "关闭", "关", "off", "disable", "disabled"}:
+                await reply(await _set_ts_lyrics_from_command(False))
+                return
+            await reply("用法: 歌词 播放 / 歌词 中断")
             return
 
         if cmd in ("now", "np", "status"):
@@ -4549,6 +4672,21 @@ async def _handle_chat_command(
             finally:
                 session.close()
             await reply(f"已清空播放队列（{result['removed_count']} 首）")
+            return
+
+        if cmd == "repeat":
+            requested = arg.strip() or head_norm
+            if not arg.strip() and head_norm in {"repeat", "循环", "循环播放"}:
+                labels = {"none": "关闭循环", "all": "列表循环", "one": "单曲循环"}
+                await reply(f"当前循环模式：{labels.get(_repeat_mode, '关闭循环')}\n用法：循环 列表 / 循环 单曲 / 循环 关闭")
+                return
+            mode = _normalize_repeat_mode(requested)
+            if mode is None:
+                await reply("用法：循环 列表 / 循环 单曲 / 循环 关闭")
+                return
+            await voice_repeat(RepeatRequest(mode=mode))
+            labels = {"none": "关闭循环", "all": "列表循环", "one": "单曲循环"}
+            await reply(f"已切换为{labels[mode]}")
             return
 
         if cmd in ("random", "order"):
@@ -5339,6 +5477,23 @@ def admin_set_custom_voice_enabled(
     return {"ok": True, "voice": _custom_voice_payload(row, welcome_voice_id=_get_welcome_voice_id(session))}
 
 
+@app.put("/admin/custom-voices/{voice_id}/volume")
+def admin_set_custom_voice_volume(
+    voice_id: int,
+    volume_percent: int,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    _, admin_session = require_admin(request, session)
+    require_csrf(request, admin_session)
+    row = session.get(CustomVoice, voice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="内置语音不存在")
+    _set_custom_voice_volume(session, voice_id, volume_percent)
+    session.commit()
+    return {"ok": True, "voice": _custom_voice_payload(row, welcome_voice_id=_get_welcome_voice_id(session))}
+
+
 @app.delete("/admin/custom-voices/{voice_id}")
 def admin_delete_custom_voice(
     voice_id: int,
@@ -5353,6 +5508,12 @@ def admin_delete_custom_voice(
     stored_path = row.stored_path
     if _get_welcome_voice_id(session) == voice_id:
         _set_welcome_voice_id(session, None)
+    enabled_setting = session.get(AppSetting, _custom_voice_setting_key(voice_id))
+    if enabled_setting is not None:
+        session.delete(enabled_setting)
+    volume_setting = session.get(AppSetting, _custom_voice_volume_setting_key(voice_id))
+    if volume_setting is not None:
+        session.delete(volume_setting)
     session.delete(row)
     session.commit()
     delete_voice_audio(stored_path)

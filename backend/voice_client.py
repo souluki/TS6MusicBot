@@ -68,14 +68,38 @@ class VoiceClient:
         resp = await stub.Ping(self._pb2.Empty())
         return resp.version
 
-    async def play(self, source_url: str, title: str, requested_by: str, notice: str = "") -> None:
+    async def play(
+        self,
+        source_url: str,
+        title: str,
+        requested_by: str,
+        notice: str = "",
+        *,
+        voice_gain: float = 1.0,
+        independent_volume: bool = False,
+    ) -> None:
         stub = self._get_stub()
         assert self._pb2 is not None
         await stub.Play(
-            self._pb2.PlayRequest(source_url=source_url, title=title, requested_by=requested_by, notice=notice)
+            self._pb2.PlayRequest(
+                source_url=source_url,
+                title=title,
+                requested_by=requested_by,
+                notice=notice,
+                voice_gain=float(voice_gain),
+                independent_volume=bool(independent_volume),
+            )
         )
 
-    async def play_overlay(self, source_url: str, title: str, requested_by: str, duck_db: float = 12.0) -> bool:
+    async def play_overlay(
+        self,
+        source_url: str,
+        title: str,
+        requested_by: str,
+        duck_db: float = 12.0,
+        *,
+        voice_gain: float = 1.0,
+    ) -> bool:
         stub = self._get_stub()
         assert self._pb2 is not None
         response = await stub.PlayOverlay(
@@ -84,6 +108,7 @@ class VoiceClient:
                 title=title,
                 requested_by=requested_by,
                 duck_db=float(duck_db),
+                voice_gain=float(voice_gain),
             )
         )
         return bool(getattr(response, "ok", False))

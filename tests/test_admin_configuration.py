@@ -25,7 +25,7 @@ from backend.config import settings
 from backend.db import Base
 from backend.models import AdminCredential
 from backend import managed_assets
-from backend.managed_assets import ASSET_BY_KEY, asset_path, delete_asset, prepare_ts_avatar, save_asset, validate_image
+from backend.managed_assets import ASSET_BY_KEY, asset_path, delete_asset, prepare_ts_avatar, save_asset, validate_image, voice_avatar_config_path
 from backend.runtime_config import (
     DEFINITION_BY_KEY,
     get_value,
@@ -207,7 +207,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         first = json.loads(self.voice_file.read_text(encoding="utf-8"))
         write_voice_config(self.session, force_restart=True)
         second = json.loads(self.voice_file.read_text(encoding="utf-8"))
-        self.assertEqual("./data/uploads/teamspeak-avatar", first["TSBOT_TS3_AVATAR_FILE"])
+        self.assertEqual(voice_avatar_config_path(), first["TSBOT_TS3_AVATAR_FILE"])
         self.assertTrue(first["TSBOT_VOICE_CONFIG_REVISION"])
         self.assertNotEqual(first["TSBOT_VOICE_CONFIG_REVISION"], second["TSBOT_VOICE_CONFIG_REVISION"])
 

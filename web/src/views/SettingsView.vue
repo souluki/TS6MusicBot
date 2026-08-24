@@ -57,6 +57,7 @@ interface CustomVoice {
   created_at: string
   is_welcome: boolean
   enabled: boolean
+  volume_percent: number
 }
 
 const GROUPS = [
@@ -91,6 +92,7 @@ const customVoices = ref<CustomVoice[]>([])
 const customVoiceCommand = ref('')
 const customVoiceLabel = ref('')
 const customVoiceBusy = ref(false)
+const customVoiceVolumeBusy = ref<Record<number, boolean>>({})
 const toastMessage = ref('')
 const toastType = ref<'success' | 'error' | 'info'>('info')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
@@ -193,6 +195,26 @@ async function setCustomVoiceEnabled(voice: CustomVoice) {
     showToast(String(e?.message || e), 'error', 8000)
   } finally {
     customVoiceBusy.value = false
+  }
+}
+
+async function setCustomVoiceVolume(voice: CustomVoice) {
+  const value = Math.max(0, Math.min(300, Math.round(Number(voice.volume_percent) || 0)))
+  voice.volume_percent = value
+  customVoiceVolumeBusy.value[voice.id] = true
+  try {
+    const result = await apiPut<{ voice: CustomVoice }>(
+      `/admin/custom-voices/${voice.id}/volume?volume_percent=${value}`,
+      {},
+    )
+    const index = customVoices.value.findIndex((item) => item.id === voice.id)
+    if (index >= 0) customVoices.value[index] = result.voice
+    showToast(`已将“${result.voice.label}”语音音量设置为 ${result.voice.volume_percent}%`, 'success')
+  } catch (e: any) {
+    showToast(String(e?.message || e), 'error', 8000)
+    await loadCustomVoices()
+  } finally {
+    customVoiceVolumeBusy.value[voice.id] = false
   }
 }
 
@@ -435,7 +457,7 @@ onBeforeUnmount(() => {
             <section v-if="activeGroup === 'teamspeak'" class="theme-settings-panel bg-white border border-gray-200 rounded-lg mb-6 p-4 md:p-5">
               <div class="mb-4">
                 <h3 class="text-sm font-semibold text-gray-800">自定义内置语音</h3>
-                <p class="text-xs text-gray-500 mt-1">上传音频并绑定一个指令；普通用户可在 TS 文字频道直接输入该指令触发。播放音乐时默认降低背景音量 12 dB 并混音。</p>
+                <p class="text-xs text-gray-500 mt-1">上传音频并绑定一个指令；普通用户可在 TS 文字频道直接输入该指令触发。每条语音包可单独设置 0～300% 增益，100% 为原始音量；播放音乐时默认降低背景音量 12 dB 并混音。</p>
               </div>
               <div class="grid md:grid-cols-[180px_minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 items-center">
                 <input v-model="customVoiceCommand" class="input-field" placeholder="指令，例如 鼓掌" />
@@ -448,10 +470,15 @@ onBeforeUnmount(() => {
                 <span class="text-xs text-gray-400">最大 50 MiB</span>
               </div>
               <div v-if="customVoices.length" class="mt-4 divide-y divide-gray-100 border-t border-gray-100">
-                <div v-for="voice in customVoices" :key="voice.id" class="py-3 flex items-center gap-3">
+                <div v-for="voice in customVoices" :key="voice.id" class="py-3 flex flex-wrap items-center gap-3">
                   <div class="min-w-0 flex-1">
                     <div class="text-sm font-medium" :class="voice.enabled ? 'text-gray-800' : 'text-gray-400'">{{ voice.label }}</div>
                     <div class="text-xs text-gray-500 mt-1">输入 <code class="font-mono">{{ voice.command }}</code> · {{ voice.original_filename }}</div>
+                    <div class="mt-2 flex items-center gap-2 text-xs text-gray-500">
+                      <span class="whitespace-nowrap">语音增益</span>
+                      <input v-model.number="voice.volume_percent" type="range" min="0" max="300" step="1" class="w-40 accent-blue-600" :disabled="customVoiceVolumeBusy[voice.id]" @change="setCustomVoiceVolume(voice)" />
+                      <span class="w-12 text-right font-mono">{{ voice.volume_percent }}%</span>
+                    </div>
                   </div>
                   <span class="text-xs" :class="voice.enabled ? 'text-green-600' : 'text-gray-400'">{{ voice.enabled ? '已启用' : '已停用' }}</span>
                   <button type="button" class="btn-secondary text-xs" :disabled="customVoiceBusy" @click="setCustomVoiceEnabled(voice)">
@@ -466,8 +493,8 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div v-else class="mt-4 text-xs text-gray-400">尚未配置内置语音。</div>
-              <div v-if="customVoices.some((voice) => voice.is_welcome)" class="mt-3 text-xs text-green-700">已配置全局欢迎语音；目标频道由上方“欢迎语音目标频道 ID”控制。Bot 不在目标频道时会跳过，不会自动移动。</div>
-              <div v-else-if="customVoices.length" class="mt-3 text-xs text-gray-500">尚未选择全局欢迎语音。点击“设为欢迎语音”后，用户进入目标频道时播放。</div>
+              <div v-if="customVoices.some((voice) => voice.is_welcome)" class="mt-3 text-xs text-green-700">已配置全局欢迎语音；填写目标频道 ID时仅在该频道触发，留空则 Bot 所在的任意频道都可触发。</div>
+              <div v-else-if="customVoices.length" class="mt-3 text-xs text-gray-500">尚未选择全局欢迎语音。点击“设为欢迎语音”后，用户进入 Bot 所在频道时播放。</div>
             </section>
 
             <section v-if="activeFields.length" class="theme-settings-panel bg-white border border-gray-200 rounded-lg divide-y divide-gray-100">

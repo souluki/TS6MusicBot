@@ -39,6 +39,10 @@ message PlayRequest {
   string title = 2;
   string requested_by = 3;
   string notice = 4;
+  // Gain used by standalone built-in voice playback. Normal music leaves this at 1.0.
+  float voice_gain = 5;
+  // When true, bypasses the shared music volume and uses voice_gain instead.
+  bool independent_volume = 6;
 }
 
 message PlayOverlayRequest {
@@ -46,6 +50,8 @@ message PlayOverlayRequest {
   string title = 2;
   string requested_by = 3;
   float duck_db = 4;
+  // Gain applied only to the overlay voice, independent of music volume.
+  float voice_gain = 5;
 }
 
 message SeekRequest {
