@@ -12,7 +12,6 @@ import {
   ListMusic, 
   Clock, 
   Settings,
-  Github,
   Moon,
   Sun,
   Menu,
@@ -178,15 +177,6 @@ function toggleTheme() {
           </div>
           
           <div class="flex items-center gap-2">
-            <a
-              href="https://github.com/yichen11818"
-              target="_blank"
-              rel="noreferrer"
-              class="theme-toolbar-btn p-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
-              title="GitHub 主页"
-            >
-              <Github :size="20" />
-            </a>
             <button
               type="button"
               :class="[
