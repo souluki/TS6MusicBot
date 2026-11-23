@@ -223,6 +223,7 @@ class VoiceClient:
         include_playback: bool = False,
         include_log: bool = False,
         include_user_joined: bool = False,
+        include_utterance: bool = False,
     ) -> AsyncIterator[object]:
         stub = self._get_stub()
         assert self._pb2 is not None
@@ -231,6 +232,7 @@ class VoiceClient:
             include_playback=include_playback,
             include_log=include_log,
             include_user_joined=include_user_joined,
+            include_utterance=include_utterance,
         )
         async for ev in stub.SubscribeEvents(req):
             yield ev

@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use audiopus::coder::Encoder;
+use audiopus::coder::{Decoder, Encoder};
+use audiopus::MutSignals;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -324,6 +325,349 @@ fn emit_playback(
             detail: detail.into(),
         })),
     });
+}
+
+struct SpeakerCapture {
+    decoder: Decoder,
+    pcm_16k: Vec<i16>,
+    decim_acc: f32,
+    decim_count: u8,
+    voiced_chunks: u32,
+    silence_samples_16k: usize,
+    energy_sum_sq: f64,
+    last_packet_at: Instant,
+    unique_id: String,
+    speaker_name: String,
+    channel_id: u64,
+}
+
+struct IncomingVoiceTracker {
+    speakers: HashMap<u16, SpeakerCapture>,
+    decode_scratch: Vec<f32>,
+    out_dir: PathBuf,
+    seq: u64,
+}
+
+impl IncomingVoiceTracker {
+    fn new(out_dir: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&out_dir);
+        Self {
+            speakers: HashMap::new(),
+            decode_scratch: vec![0.0f32; 5760 * 2],
+            out_dir,
+            seq: 0,
+        }
+    }
+
+    fn handle_audio(
+        &mut self,
+        con: &Connection,
+        packet: tsproto_packets::packets::InAudioBuf,
+        events_tx: &broadcast::Sender<voicev1::Event>,
+    ) {
+        let audio_data = packet.data().data();
+        let from_id = match audio_data {
+            AudioData::S2C { from, .. } | AudioData::S2CWhisper { from, .. } => *from,
+            _ => return,
+        };
+        let codec = audio_data.codec();
+        if codec != CodecType::OpusVoice && codec != CodecType::OpusMusic {
+            return;
+        }
+
+        let mut unique_id = String::new();
+        let mut speaker_name = String::new();
+        let mut channel_id = 0u64;
+        if let Ok(st) = con.get_state() {
+            let cid = tsclientlib::ClientId(from_id);
+            if cid == st.own_client {
+                return;
+            }
+            if let Some(c) = st.clients.get(&cid) {
+                unique_id = c.uid.as_ref().map(|u| u.as_ref().to_string()).unwrap_or_default();
+                speaker_name = c.name.clone();
+                channel_id = c.channel.0;
+            }
+        }
+
+        let raw_opus = audio_data.data();
+        if raw_opus.len() <= 1 {
+            if let Some(mut cap) = self.speakers.remove(&from_id) {
+                if !unique_id.is_empty() {
+                    cap.unique_id = unique_id;
+                }
+                if !speaker_name.is_empty() {
+                    cap.speaker_name = speaker_name;
+                }
+                if channel_id > 0 {
+                    cap.channel_id = channel_id;
+                }
+                self.emit_if_valid(from_id, &mut cap, events_tx);
+            }
+            return;
+        }
+
+        let pkt_for_len: audiopus::packet::Packet<'_> = match raw_opus.try_into() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let max_samples = audiopus::packet::nb_samples(pkt_for_len, audiopus::SampleRate::Hz48000)
+            .unwrap_or(960)
+            .min(5760);
+        if max_samples == 0 {
+            return;
+        }
+        let Ok(pkt): std::result::Result<audiopus::packet::Packet<'_>, _> = raw_opus.try_into() else {
+            return;
+        };
+
+        if !self.speakers.contains_key(&from_id) {
+            let Ok(decoder) = Decoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Stereo) else {
+                return;
+            };
+            self.speakers.insert(
+                from_id,
+                SpeakerCapture {
+                    decoder,
+                    pcm_16k: Vec::with_capacity(16000 * 4),
+                    decim_acc: 0.0,
+                    decim_count: 0,
+                    voiced_chunks: 0,
+                    silence_samples_16k: 0,
+                    energy_sum_sq: 0.0,
+                    last_packet_at: Instant::now(),
+                    unique_id: unique_id.clone(),
+                    speaker_name: speaker_name.clone(),
+                    channel_id,
+                },
+            );
+        }
+
+        let need_floats = max_samples * 2;
+        if self.decode_scratch.len() < need_floats {
+            self.decode_scratch.resize(need_floats, 0.0);
+        }
+
+        let decoded_per_ch = {
+            let Some(cap) = self.speakers.get_mut(&from_id) else {
+                return;
+            };
+            cap.last_packet_at = Instant::now();
+            if !unique_id.is_empty() {
+                cap.unique_id = unique_id;
+            }
+            if !speaker_name.is_empty() {
+                cap.speaker_name = speaker_name;
+            }
+            if channel_id > 0 {
+                cap.channel_id = channel_id;
+            }
+            let Ok(output): std::result::Result<MutSignals<'_, f32>, _> =
+                (&mut self.decode_scratch[..need_floats]).try_into()
+            else {
+                return;
+            };
+            match cap.decoder.decode_float(Some(pkt), output, false) {
+                Ok(n) => n.min(max_samples),
+                Err(_) => return,
+            }
+        };
+
+        if decoded_per_ch == 0 {
+            return;
+        }
+
+        let mut should_flush_segment = false;
+        if let Some(cap) = self.speakers.get_mut(&from_id) {
+            let mut chunk_sq = 0.0f64;
+            let mut chunk_n = 0usize;
+            for i in 0..decoded_per_ch {
+                let l = self.decode_scratch[i * 2];
+                let r = self.decode_scratch[i * 2 + 1];
+                let mono = 0.5 * (l + r);
+                cap.decim_acc += mono;
+                cap.decim_count += 1;
+                if cap.decim_count == 3 {
+                    let s = (cap.decim_acc / 3.0).clamp(-1.0, 1.0);
+                    cap.decim_acc = 0.0;
+                    cap.decim_count = 0;
+                    let q = (s * 32767.0) as i16;
+                    cap.pcm_16k.push(q);
+                    let sf = s as f64;
+                    chunk_sq += sf * sf;
+                    cap.energy_sum_sq += sf * sf;
+                    chunk_n += 1;
+                }
+            }
+            if chunk_n > 0 {
+                let chunk_rms = (chunk_sq / (chunk_n as f64)).sqrt();
+                if chunk_rms >= 0.008 {
+                    cap.voiced_chunks += 1;
+                    cap.silence_samples_16k = 0;
+                } else {
+                    cap.silence_samples_16k += chunk_n;
+                }
+            }
+            // Segment open-mic pause (~650ms silence after >=160ms voiced speech) or 12s max cap
+            if (cap.voiced_chunks >= 8 && cap.silence_samples_16k >= 10400)
+                || cap.pcm_16k.len() >= 16000 * 12
+            {
+                should_flush_segment = true;
+            }
+        }
+
+        if should_flush_segment {
+            let mut temp_cap = None;
+            if let Some(cap) = self.speakers.get_mut(&from_id) {
+                let pcm = std::mem::replace(&mut cap.pcm_16k, Vec::with_capacity(16000 * 4));
+                let voiced = std::mem::replace(&mut cap.voiced_chunks, 0);
+                let energy = std::mem::replace(&mut cap.energy_sum_sq, 0.0);
+                cap.silence_samples_16k = 0;
+                if let Ok(dummy_dec) = Decoder::new(audiopus::SampleRate::Hz48000, audiopus::Channels::Stereo) {
+                    temp_cap = Some(SpeakerCapture {
+                        decoder: dummy_dec,
+                        pcm_16k: pcm,
+                        decim_acc: 0.0,
+                        decim_count: 0,
+                        voiced_chunks: voiced,
+                        silence_samples_16k: 0,
+                        energy_sum_sq: energy,
+                        last_packet_at: cap.last_packet_at,
+                        unique_id: cap.unique_id.clone(),
+                        speaker_name: cap.speaker_name.clone(),
+                        channel_id: cap.channel_id,
+                    });
+                }
+            }
+            if let Some(mut seg) = temp_cap {
+                self.emit_if_valid(from_id, &mut seg, events_tx);
+            }
+        }
+    }
+
+    fn flush_expired(&mut self, events_tx: &broadcast::Sender<voicev1::Event>) {
+        let expired_ids: Vec<u16> = self
+            .speakers
+            .iter()
+            .filter_map(|(cid, cap)| {
+                if cap.last_packet_at.elapsed() >= Duration::from_millis(650) {
+                    Some(*cid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for cid in expired_ids {
+            if let Some(mut cap) = self.speakers.remove(&cid) {
+                self.emit_if_valid(cid, &mut cap, events_tx);
+            }
+        }
+    }
+
+    fn emit_if_valid(
+        &mut self,
+        client_id: u16,
+        cap: &mut SpeakerCapture,
+        events_tx: &broadcast::Sender<voicev1::Event>,
+    ) {
+        let total_samples = cap.pcm_16k.len();
+        if total_samples < 5600 || cap.voiced_chunks < 5 {
+            return;
+        }
+        let rms = (cap.energy_sum_sq / (total_samples as f64)).sqrt() as f32;
+        if rms < 0.005 {
+            return;
+        }
+        let duration_ms = ((total_samples as u64) * 1000 / 16000) as u32;
+        let _ = fs::create_dir_all(&self.out_dir);
+        self.seq = self.seq.wrapping_add(1);
+        let unix_ms = now_unix_ms();
+        let file_name = format!("utt_{}_{}_{}.wav", unix_ms, client_id, self.seq);
+        let wav_path = self.out_dir.join(file_name);
+        if write_wav_16k_mono(&wav_path, &cap.pcm_16k).is_err() {
+            return;
+        }
+        prune_utterance_dir(&self.out_dir, 36);
+        info!(
+            speaker = %cap.speaker_name,
+            client_id = client_id,
+            duration_ms = duration_ms,
+            rms = %format!("{rms:.4}"),
+            wav = %wav_path.display(),
+            "ts3 voice utterance captured"
+        );
+        let _ = events_tx.send(voicev1::Event {
+            unix_ms,
+            payload: Some(voicev1::event::Payload::Utterance(
+                voicev1::VoiceUtteranceEvent {
+                    channel_id: cap.channel_id,
+                    client_id: client_id as u64,
+                    unique_id: cap.unique_id.clone(),
+                    speaker_name: cap.speaker_name.clone(),
+                    wav_path: wav_path.to_string_lossy().to_string(),
+                    duration_ms,
+                    rms,
+                },
+            )),
+        });
+    }
+}
+
+fn write_wav_16k_mono(path: &Path, samples: &[i16]) -> std::io::Result<()> {
+    let data_bytes = (samples.len() * 2) as u32;
+    let riff_size = 36u32.saturating_add(data_bytes);
+    let mut buf = Vec::with_capacity(44 + samples.len() * 2);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&riff_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // Mono
+    buf.extend_from_slice(&16000u32.to_le_bytes());
+    buf.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in samples {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    fs::write(path, buf)
+}
+
+fn prune_utterance_dir(dir: &Path, keep_max: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut wavs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            let is_wav = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("wav"))
+                .unwrap_or(false);
+            if !is_wav {
+                return None;
+            }
+            let mtime = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some((mtime, p))
+        })
+        .collect();
+    if wavs.len() <= keep_max {
+        return;
+    }
+    wavs.sort_by_key(|(t, _)| *t);
+    let remove_count = wavs.len().saturating_sub(keep_max);
+    for (_, p) in wavs.into_iter().take(remove_count) {
+        let _ = fs::remove_file(p);
+    }
 }
 
 fn normalize_notice_target_mode(requested_mode: i32) -> i32 {
@@ -764,6 +1108,7 @@ impl VoiceService for VoiceServiceImpl {
             let include_playback = cfg.include_playback;
             let include_log = cfg.include_log;
             let include_user_joined = cfg.include_user_joined;
+            let include_utterance = cfg.include_utterance;
             async move {
                 match r {
                     Ok(ev) => {
@@ -772,6 +1117,7 @@ impl VoiceService for VoiceServiceImpl {
                             Some(voicev1::event::Payload::Playback(_)) => include_playback,
                             Some(voicev1::event::Payload::Log(_)) => include_log,
                             Some(voicev1::event::Payload::UserJoined(_)) => include_user_joined,
+                            Some(voicev1::event::Payload::Utterance(_)) => include_utterance,
                             None => false,
                         };
                         if ok { Some(Ok(ev)) } else { None }
@@ -1443,6 +1789,7 @@ async fn ts3_actor(
         let mut nickname_inflight: Option<(tsclientlib::MessageHandle, NicknameUpdateState)> = None;
         let mut last_notice_sent = Instant::now() - Duration::from_secs(60);
         let mut conn_err: Option<String> = None;
+        let mut voice_tracker = IncomingVoiceTracker::new(resolve_repo_relative("./logs/utterances"));
 
         let mut send_last_tick = Instant::now();
         let mut send_jitter_max_ms: u128 = 0;
@@ -1672,6 +2019,17 @@ async fn ts3_actor(
                                             }
                                         }
                                         events::Event::Message { target, invoker, message } => {
+                                        if let Ok(st) = con.get_state() {
+                                            if let Some(own_c) = st.clients.get(&st.own_client) {
+                                                let own_uid = own_c.uid.as_ref().map(|u| u.as_ref().to_string()).unwrap_or_default();
+                                                let inv_uid = invoker.uid.as_ref().map(|u| u.as_ref().to_string()).unwrap_or_default();
+                                                if (!inv_uid.is_empty() && inv_uid == own_uid)
+                                                    || (inv_uid.is_empty() && invoker.name == own_c.name)
+                                                {
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         let mode = match target {
                                             MessageTarget::Client(_) | MessageTarget::Poke(_) => 1,
                                             MessageTarget::Channel => 2,
@@ -1857,6 +2215,10 @@ async fn ts3_actor(
                                 );
                             }
 
+                            Some(Some(Ok(StreamItem::Audio(audio_buf)))) => {
+                                voice_tracker.handle_audio(&con, audio_buf, &events_tx);
+                            }
+
                             Some(Some(Ok(item))) => {
                                 let mut s = format!("{item:?}");
                                 let lower = s.to_ascii_lowercase();
@@ -1883,7 +2245,10 @@ async fn ts3_actor(
                                 connection_ready = false;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                voice_tracker.flush_expired(&events_tx);
+                                break;
+                            }
                         }
                     }
 

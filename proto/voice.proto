@@ -125,6 +125,7 @@ message SubscribeRequest {
   bool include_playback = 2;
   bool include_log = 3;
   bool include_user_joined = 4;
+  bool include_utterance = 5;
 }
 
 message Event {
@@ -135,7 +136,18 @@ message Event {
     PlaybackEvent playback = 3;
     LogEvent log = 4;
     UserJoinedEvent user_joined = 5;
+    VoiceUtteranceEvent utterance = 6;
   }
+}
+
+message VoiceUtteranceEvent {
+  uint64 channel_id = 1;
+  uint64 client_id = 2;
+  string unique_id = 3;
+  string speaker_name = 4;
+  string wav_path = 5;
+  uint32 duration_ms = 6;
+  float rms = 7;
 }
 
 message UserJoinedEvent {
