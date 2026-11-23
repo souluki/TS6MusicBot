@@ -393,3 +393,124 @@ class HachimiBootAndModeSwitchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(pl_enq_mock.await_args_list[1].kwargs["play_now"])
         finally:
             session.close()
+
+    async def test_ts_auth_chain_multi_sa_and_hybrid_failover(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td)
+            rt_dir = fake_home / "runtime"
+            fb_dir = rt_dir / "gemini_key"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            sa1 = rt_dir / "gemini-service-account.json"
+            sa1_data = {
+                "type": "service_account",
+                "project_id": "proj-primary",
+                "private_key": "-----BEGIN PRIVATE KEY-----\nd1\n-----END PRIVATE KEY-----\n",
+                "client_email": "bot@proj-primary.iam.gserviceaccount.com",
+            }
+            sa1.write_text(json.dumps(sa1_data), encoding="utf-8")
+            # Duplicate first file + second distinct SA in fallback dir
+            (fb_dir / "00_dup.json").write_text(json.dumps(sa1_data), encoding="utf-8")
+            (fb_dir / "01_secondary.json").write_text(
+                json.dumps(
+                    {
+                        "type": "service_account",
+                        "project_id": "proj-secondary",
+                        "private_key": "-----BEGIN PRIVATE KEY-----\nd2\n-----END PRIVATE KEY-----\n",
+                        "client_email": "bot@proj-secondary.iam.gserviceaccount.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (rt_dir / "local-secrets.json").write_text(
+                json.dumps(
+                    {
+                        "gemini_service_account_file": str(sa1),
+                        "gemini_service_account_fallback_dir": str(fb_dir),
+                        "gemini_backup_api_keys": ["AQ.BackupExpressKey999999999999", "sk-never-include-openai"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            brain = HachimiTsBrain(hachimi_home=fake_home)
+            chain, mdl = brain._resolve_gemini_auth_chain()
+            self.assertEqual(mdl, "gemini-4-argon")
+            self.assertEqual(
+                [c["label"] for c in chain],
+                ["vertex_sa:proj-primary", "vertex_sa:proj-secondary", "backup_key_1"],
+            )
+
+            class _QuotaErr(Exception):
+                code = 429
+                status = "RESOURCE_EXHAUSTED"
+
+            calls: list[tuple[str, str]] = []
+
+            async def p_gen(*, model, contents, config=None):
+                calls.append(("primary", model))
+                if model.startswith("gemini-4"):
+                    raise _QuotaErr("429 RESOURCE_EXHAUSTED")
+                return SimpleNamespace(text='{"taste_summary":"华语流行"}')
+
+            async def b_gen(*, model, contents, config=None):
+                calls.append(("backup", model))
+                return SimpleNamespace(
+                    text='{"transcript":"切歌","should_reply":true,"spoken_reply":"好嘞","chat_reply":"好嘞","music_cmd":"skip","music_arg":""}'
+                )
+
+            p_cli = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=p_gen)))
+            b_cli = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=b_gen)))
+            brain._genai_types = SimpleNamespace(
+                GenerateContentConfig=lambda **kw: kw,
+                ThinkingConfig=lambda **kw: kw,
+                ThinkingLevel=SimpleNamespace(LOW="LOW"),
+            )
+            brain._backends = [
+                {
+                    "label": "vertex_sa:proj-primary",
+                    "kind": "vertex_sa",
+                    "client": p_cli,
+                    "cooldown_until": 0.0,
+                    "model_cooldowns": {},
+                    "model_strikes": {},
+                    "probing_models": set(),
+                },
+                {
+                    "label": "backup_key_1",
+                    "kind": "api_key",
+                    "client": b_cli,
+                    "cooldown_until": 0.0,
+                    "model_cooldowns": {},
+                    "model_strikes": {},
+                    "probing_models": set(),
+                },
+            ]
+            brain._genai_client = p_cli
+            brain._initial_genai_client = p_cli
+            brain._warmup_started = True
+
+            await brain.warmup_probe()
+            calls.clear()
+
+            from backend.hachimi_brain import UserTasteSummarySchema
+
+            plan = await brain._call_structured_gemini(
+                system_instruction="sys",
+                contents=["切歌"],
+                schema_cls=TsHachimiPlan,
+            )
+            self.assertEqual(plan.music_cmd, "skip")
+            taste = await brain._call_structured_gemini(
+                system_instruction="sys",
+                contents=["taste"],
+                schema_cls=UserTasteSummarySchema,
+                model=brain._lite_model,
+            )
+            self.assertEqual(taste.taste_summary, "华语流行")
+            self.assertEqual(
+                calls,
+                [("backup", "gemini-4-argon"), ("primary", "gemini-3.5-flash-lite")],
+            )
+            await brain.close()

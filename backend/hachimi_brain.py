@@ -141,6 +141,89 @@ class AffectSnapshot:
     circadian: str = "白天精神正常"
 
 
+_SECRET_RE = re.compile(
+    r"(AIza[0-9A-Za-z_-]{20,}|AQ\.[0-9A-Za-z_.-]{16,}|ya29\.[0-9A-Za-z_.-]{16,}|sk-[0-9A-Za-z_-]{16,}|key=[0-9A-Za-z_.-]{12,})"
+)
+
+
+def _scrub_error_secrets(raw: Any) -> str:
+    return _SECRET_RE.sub("[REDACTED]", str(raw or ""))
+
+
+def _iter_service_account_jsons(
+    raw_path: str | Path, base_dir: Path | None = None
+) -> list[tuple[Path, dict[str, Any]]]:
+    raw_str = str(raw_path or "").strip()
+    if not raw_str:
+        return []
+    p = Path(raw_str)
+    candidates = (
+        [p] if p.is_absolute() else ([base_dir / p, p] if base_dir is not None else [p])
+    )
+    results: list[tuple[Path, dict[str, Any]]] = []
+    seen_resolved: set[Path] = set()
+    for cand in candidates:
+        try:
+            if not cand.exists():
+                continue
+            json_files = [cand] if cand.is_file() else sorted(cand.glob("*.json"))
+        except Exception:
+            continue
+        for jf in json_files:
+            try:
+                if not jf.is_file() or jf.stat().st_size > 262144:
+                    continue
+                resolved_jf = jf.resolve()
+                if resolved_jf in seen_resolved:
+                    continue
+                data = json.loads(jf.read_text(encoding="utf-8-sig"))
+                if (
+                    isinstance(data, dict)
+                    and data.get("type") == "service_account"
+                    and data.get("project_id")
+                    and data.get("private_key")
+                    and data.get("client_email")
+                ):
+                    seen_resolved.add(resolved_jf)
+                    results.append((resolved_jf, data))
+            except Exception:
+                continue
+        if results:
+            break
+    return results
+
+
+def _classify_failover_cooldown(exc: BaseException) -> tuple[bool, float, str]:
+    if isinstance(exc, (asyncio.CancelledError, asyncio.TimeoutError, TimeoutError)):
+        return False, 0.0, type(exc).__name__
+    code_raw = getattr(exc, "code", None)
+    if code_raw is None:
+        code_raw = getattr(exc, "status_code", None)
+    try:
+        code = int(code_raw) if code_raw is not None else None
+    except (TypeError, ValueError):
+        code = None
+    summary = _scrub_error_secrets(f"{code or ''} {getattr(exc, 'status', '')} {exc}").strip()[:180]
+    low = summary.lower()
+    if code in (401, 402, 403) or any(
+        k in low
+        for k in (
+            "api_key_invalid",
+            "api key not valid",
+            "permission_denied",
+            "unauthenticated",
+            "consumer_suspended",
+            "billing",
+        )
+    ):
+        return True, 3600.0, summary
+    if code == 429 or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+        return True, 1800.0, summary
+    if code in (500, 502, 503, 504) or isinstance(exc, (ConnectionError, OSError)):
+        return True, 30.0, summary
+    return False, 0.0, summary
+
+
 def sanitize_outbound_text(text: str) -> str:
     cleaned = str(text or "").strip()
     if not cleaned:
@@ -169,8 +252,13 @@ class HachimiTsBrain:
         self._pg_unavailable_until = 0.0
 
         self._genai_client: Any = None
+        self._initial_genai_client: Any = None
         self._genai_types: Any = None
+        self._backends: list[dict[str, Any]] = []
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._warmup_started = False
         self._model_name = "gemini-4-argon"
+        self._lite_model = "gemini-3.5-flash-lite"
 
         self._persona_cache = ""
         self._persona_mtime = 0.0
@@ -210,62 +298,424 @@ class HachimiTsBrain:
             "说话自然利落、口语化、有分寸，绝不骂人脑子傻，对初识群友保持客气礼貌。"
         )
 
-    def _resolve_gemini_credentials(self) -> tuple[str, str]:
-        api_key = (os.getenv("TSBOT_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    def _resolve_gemini_auth_chain(self) -> tuple[list[dict[str, Any]], str]:
+        chain: list[dict[str, Any]] = []
+        seen_sa_keys: set[str] = set()
+        seen_api_keys: set[str] = set()
         model_name = os.getenv("TSBOT_GEMINI_MODEL", "").strip() or "gemini-4-argon"
 
         sec_path = self._secrets_file()
+        base_dir = sec_path.resolve().parent if sec_path.exists() else sec_path.parent
+        sec: dict[str, Any] = {}
         if sec_path.is_file():
             try:
-                sec = json.loads(sec_path.read_text(encoding="utf-8-sig"))
-                if not api_key and sec.get("gemini_api_key"):
-                    api_key = str(sec["gemini_api_key"]).strip()
-                if sec.get("gemini_model") and not os.getenv("TSBOT_GEMINI_MODEL"):
-                    model_name = str(sec["gemini_model"]).strip()
+                loaded = json.loads(sec_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    sec = loaded
             except Exception:
-                pass
+                sec = {}
+
+        if not os.getenv("TSBOT_GEMINI_MODEL") and sec.get("ts_gemini_model"):
+            model_name = str(sec["ts_gemini_model"]).strip()
+
+        vertex_loc = (
+            os.getenv("GEMINI_VERTEX_LOCATION", "").strip()
+            or str(sec.get("gemini_vertex_location") or "global").strip()
+            or "global"
+        )
+
+        def _add_sa(raw_cand: Any) -> None:
+            for sa_file, sa_data in _iter_service_account_jsons(raw_cand, base_dir):
+                proj = str(sa_data["project_id"]).strip()
+                dedup_k = f"{proj}:{sa_data.get('client_email', '')}"
+                if dedup_k in seen_sa_keys:
+                    continue
+                seen_sa_keys.add(dedup_k)
+                base_lbl = f"vertex_sa:{proj}"
+                existing_lbls = {item.get("label") for item in chain}
+                lbl = base_lbl
+                if lbl in existing_lbls:
+                    suffix = 2
+                    while f"{base_lbl}#{suffix}" in existing_lbls:
+                        suffix += 1
+                    lbl = f"{base_lbl}#{suffix}"
+                chain.append(
+                    {
+                        "kind": "vertex_sa",
+                        "label": lbl,
+                        "service_account_file": str(sa_file),
+                        "project": proj,
+                        "location": vertex_loc,
+                    }
+                )
+
+        def _add_api_key(raw_k: Any, role_prefix: str = "backup_key") -> None:
+            k = str(raw_k or "").strip()
+            if not k or k.startswith("sk-") or k in seen_api_keys:
+                return
+            seen_api_keys.add(k)
+            idx = sum(1 for item in chain if item.get("kind") == "api_key") + 1
+            chain.append(
+                {
+                    "kind": "api_key",
+                    "label": f"{role_prefix}_{idx}",
+                    "api_key": k,
+                }
+            )
+
+        for sa_cand in (
+            os.getenv("TSBOT_GEMINI_SERVICE_ACCOUNT_FILE", ""),
+            os.getenv("GEMINI_SERVICE_ACCOUNT_FILE", ""),
+            sec.get("gemini_service_account_file", ""),
+            sec.get("gemini_service_account_fallback_dir", ""),
+        ):
+            if sa_cand:
+                _add_sa(sa_cand)
+
+        for explicit_k in (
+            os.getenv("TSBOT_GEMINI_API_KEY", ""),
+            os.getenv("GEMINI_API_KEY", ""),
+            sec.get("gemini_api_key", ""),
+        ):
+            if explicit_k:
+                _add_api_key(explicit_k, "primary_key" if not chain else "backup_key")
+
+        raw_backups = sec.get("gemini_backup_api_keys")
+        if isinstance(raw_backups, list):
+            for bk in raw_backups:
+                _add_api_key(bk, "backup_key")
+        elif isinstance(raw_backups, str) and raw_backups.strip():
+            _add_api_key(raw_backups, "backup_key")
 
         cfg_path = self._cmd_config_file()
+        allowed_google_types = {"googlegenai_chat_completion", "gemini"}
         if cfg_path.is_file():
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
                 providers = cfg.get("provider", [])
-                sources = {s.get("id"): s for s in cfg.get("provider_sources", []) if isinstance(s, dict)}
+                sources = {
+                    s.get("id"): s
+                    for s in cfg.get("provider_sources", [])
+                    if isinstance(s, dict)
+                }
+                role_tag = "backup_key" if chain else "primary_key"
                 matched = next(
-                    (p for p in providers if p.get("enable") and "gemini-4-argon" in str(p.get("model", ""))),
+                    (
+                        p
+                        for p in providers
+                        if p.get("enable") and "gemini-4-argon" in str(p.get("model", ""))
+                    ),
                     None,
                 )
                 if matched:
                     raw_m = str(matched.get("model", "")).strip()
-                    if raw_m:
+                    if raw_m and not os.getenv("TSBOT_GEMINI_MODEL") and not sec.get("ts_gemini_model"):
                         model_name = raw_m.removeprefix("models/")
                     src = sources.get(matched.get("provider_source_id"))
-                    if not api_key and src and src.get("key"):
-                        api_key = str(src["key"][0]).strip()
-                if not api_key:
-                    for src in cfg.get("provider_sources", []):
-                        if src.get("type") == "googlegenai_chat_completion" and src.get("key"):
-                            api_key = str(src["key"][0]).strip()
-                            break
+                    if (
+                        src
+                        and src.get("key")
+                        and str(src.get("type") or "").lower() in allowed_google_types
+                    ):
+                        for k_item in src["key"]:
+                            _add_api_key(k_item, role_tag)
+                for src in cfg.get("provider_sources", []):
+                    if (
+                        isinstance(src, dict)
+                        and str(src.get("type") or "").lower() in allowed_google_types
+                        and src.get("key")
+                    ):
+                        for k_item in src["key"]:
+                            _add_api_key(k_item, role_tag)
             except Exception:
                 pass
 
-        return api_key, model_name.removeprefix("models/")
+        return chain, model_name.removeprefix("models/")
+
+    def _resolve_gemini_credentials(self) -> tuple[str, str]:
+        chain, model_name = self._resolve_gemini_auth_chain()
+        for item in chain:
+            if item.get("kind") == "api_key" and item.get("api_key"):
+                return str(item["api_key"]), model_name
+        if chain and chain[0].get("kind") == "vertex_sa":
+            return f"vertex_sa:{chain[0]['service_account_file']}", model_name
+        return "", model_name
+
+    def _track_bg_task(self, coro: Any) -> asyncio.Task[Any] | None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return None
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _coupled_family_models(self, model: str) -> tuple[str, ...]:
+        clean = str(model or "").removeprefix("models/").strip()
+        if not clean:
+            return ()
+        if clean.lower().startswith("gemini-4"):
+            ordered = [clean]
+            sib = str(self._model_name or "").removeprefix("models/").strip()
+            if sib and sib.lower().startswith("gemini-4") and sib not in ordered:
+                ordered.append(sib)
+            return tuple(ordered)
+        return (clean,)
 
     def _ensure_genai(self) -> bool:
         if self._genai_client is not None:
+            if len(self._backends) > 1 and not self._warmup_started:
+                t = self._track_bg_task(self.warmup_probe())
+                if t is not None:
+                    self._warmup_started = True
             return True
-        api_key, model_name = self._resolve_gemini_credentials()
-        if not api_key:
-            logger.warning("hachimi gemini api key unavailable")
+        chain, model_name = self._resolve_gemini_auth_chain()
+        if not chain:
+            logger.warning("hachimi gemini credentials unavailable")
             return False
         from google import genai
         from google.genai import types
 
-        self._genai_client = genai.Client(api_key=api_key)
+        has_multi = len(chain) > 1
+        fast_http_opts = (
+            types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+            if has_multi and hasattr(types, "HttpRetryOptions")
+            else None
+        )
+        backends: list[dict[str, Any]] = []
+        for idx_s, spec in enumerate(chain):
+            kind = str(spec.get("kind") or "api_key")
+            label = str(spec.get("label") or kind)
+            use_fast_fail = fast_http_opts if (has_multi and idx_s < len(chain) - 1) else None
+            try:
+                if kind == "vertex_sa":
+                    from google.oauth2 import service_account
+
+                    creds = service_account.Credentials.from_service_account_file(
+                        str(spec["service_account_file"]),
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    )
+                    sa_kw: dict[str, Any] = {
+                        "vertexai": True,
+                        "project": str(spec["project"]),
+                        "location": str(spec.get("location") or "global"),
+                        "credentials": creds,
+                    }
+                    if use_fast_fail is not None:
+                        sa_kw["http_options"] = use_fast_fail
+                    cli_obj = genai.Client(**sa_kw)
+                else:
+                    ak_kw: dict[str, Any] = {"api_key": str(spec["api_key"])}
+                    if use_fast_fail is not None:
+                        ak_kw["http_options"] = use_fast_fail
+                    cli_obj = genai.Client(**ak_kw)
+                backends.append(
+                    {
+                        "label": label,
+                        "kind": kind,
+                        "client": cli_obj,
+                        "cooldown_until": 0.0,
+                        "model_cooldowns": {},
+                        "model_strikes": {},
+                        "probing_models": set(),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("skipping invalid gemini source %s: %s", label, _scrub_error_secrets(exc))
+                continue
+
+        if not backends:
+            logger.warning("no usable gemini backend initialized")
+            return False
+
+        self._backends = backends
+        self._genai_client = backends[0]["client"]
+        self._initial_genai_client = self._genai_client
         self._genai_types = types
         self._model_name = model_name
+        logger.info(
+            "tsbot hachimi genai initialized: model=%s lite_model=%s sources=%s",
+            self._model_name,
+            self._lite_model,
+            [b["label"] for b in backends],
+        )
+        if len(backends) > 1 and not self._warmup_started:
+            t = self._track_bg_task(self.warmup_probe())
+            if t is not None:
+                self._warmup_started = True
         return True
+
+    async def _probe_backend_model(self, backend: dict[str, Any], model: str) -> None:
+        probing = backend.setdefault("probing_models", set())
+        coupled = self._coupled_family_models(model) or (model,)
+        if any(m in probing for m in coupled):
+            return
+        probing.update(coupled)
+        try:
+            types = self._genai_types
+            cfg_kw: dict[str, Any] = {"max_output_tokens": 32}
+            lvl = getattr(types.ThinkingLevel, "LOW", None)
+            if lvl is not None:
+                cfg_kw["thinking_config"] = types.ThinkingConfig(thinking_level=lvl)
+            await asyncio.wait_for(
+                backend["client"].aio.models.generate_content(
+                    model=model,
+                    contents="简短回复收到即可",
+                    config=types.GenerateContentConfig(**cfg_kw),
+                ),
+                timeout=16.0,
+            )
+            backend["cooldown_until"] = 0.0
+            for m in coupled:
+                (backend.get("model_cooldowns") or {}).pop(m, None)
+                (backend.get("model_strikes") or {}).pop(m, None)
+            logger.info("tsbot hachimi primary %s [models=%s] recovered", backend["label"], ",".join(coupled))
+        except (TimeoutError, asyncio.TimeoutError):
+            until_ts = time.monotonic() + 300.0
+            for m in coupled:
+                backend.setdefault("model_cooldowns", {})[m] = until_ts
+        except Exception as exc:
+            should_fo, base_cd, _ = _classify_failover_cooldown(exc)
+            if should_fo:
+                strikes = int((backend.get("model_strikes") or {}).get(model) or 1) + 1
+                eff_cd = min(3600.0 if base_cd >= 3600.0 else 1800.0, base_cd * (2 ** min(3, strikes - 1)))
+                for m in coupled:
+                    backend.setdefault("model_strikes", {})[m] = strikes
+                if base_cd >= 3600.0:
+                    backend["cooldown_until"] = time.monotonic() + eff_cd
+                else:
+                    until_ts = time.monotonic() + eff_cd
+                    for m in coupled:
+                        backend.setdefault("model_cooldowns", {})[m] = until_ts
+        finally:
+            probing.difference_update(coupled)
+
+    async def warmup_probe(self) -> None:
+        backends = self._backends
+        if len(backends) <= 1 or self._genai_types is None:
+            return
+        primary = backends[0]
+        coupled = self._coupled_family_models(self._model_name) or (self._model_name,)
+        try:
+            types = self._genai_types
+            cfg_kw: dict[str, Any] = {"max_output_tokens": 32}
+            lvl = getattr(types.ThinkingLevel, "LOW", None)
+            if lvl is not None:
+                cfg_kw["thinking_config"] = types.ThinkingConfig(thinking_level=lvl)
+            await asyncio.wait_for(
+                primary["client"].aio.models.generate_content(
+                    model=self._model_name,
+                    contents="简短回复收到即可",
+                    config=types.GenerateContentConfig(**cfg_kw),
+                ),
+                timeout=16.0,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            until_ts = time.monotonic() + 300.0
+            for m in coupled:
+                primary.setdefault("model_strikes", {})[m] = 1
+                primary.setdefault("model_cooldowns", {})[m] = until_ts
+            logger.warning(
+                "tsbot hachimi warmup: primary %s [models=%s] timed out; pre-routing to %s",
+                primary["label"],
+                ",".join(coupled),
+                backends[1]["label"],
+            )
+        except Exception as exc:
+            should_fo, cd_secs, safe_sum = _classify_failover_cooldown(exc)
+            if should_fo:
+                for m in coupled:
+                    primary.setdefault("model_strikes", {})[m] = 1
+                if cd_secs >= 3600.0:
+                    primary["cooldown_until"] = time.monotonic() + cd_secs
+                else:
+                    until_ts = time.monotonic() + cd_secs
+                    for m in coupled:
+                        primary.setdefault("model_cooldowns", {})[m] = until_ts
+                logger.warning(
+                    "tsbot hachimi warmup: primary %s [models=%s] throttled (%s); hybrid-routing gemini-4 to %s while keeping flash-lite on primary",
+                    primary["label"],
+                    ",".join(coupled),
+                    safe_sum,
+                    backends[1]["label"],
+                )
+
+    async def _generate_with_failover(self, *, model: str, contents: Any, config: Any) -> Any:
+        cur_cli = self._genai_client
+        if not self._backends or cur_cli is not self._initial_genai_client:
+            return await cur_cli.aio.models.generate_content(model=model, contents=contents, config=config)
+
+        coupled = self._coupled_family_models(model) or (model,)
+        now_m = time.monotonic()
+        has_healthy_alt = any(
+            max(
+                float(b.get("cooldown_until") or 0.0),
+                float((b.get("model_cooldowns") or {}).get(model) or 0.0),
+            )
+            <= now_m
+            for b in self._backends[1:]
+        )
+        if has_healthy_alt and len(self._backends) > 1:
+            p0 = self._backends[0]
+            p0_mdl_cds = p0.setdefault("model_cooldowns", {})
+            exp_mdl_ts = float(p0_mdl_cds.get(model) or 0.0)
+            exp_acct_ts = float(p0.get("cooldown_until") or 0.0)
+            if 0.0 < max(exp_mdl_ts, exp_acct_ts) <= now_m:
+                for m in coupled:
+                    p0_mdl_cds[m] = now_m + 30.0
+                if exp_acct_ts > 0.0:
+                    p0["cooldown_until"] = now_m + 30.0
+                self._track_bg_task(self._probe_backend_model(p0, model))
+                now_m = time.monotonic()
+
+        def _eff_cd(b: dict[str, Any]) -> float:
+            return max(
+                float(b.get("cooldown_until") or 0.0),
+                float((b.get("model_cooldowns") or {}).get(model) or 0.0),
+            )
+
+        ordered = [b for b in self._backends if _eff_cd(b) <= now_m] + sorted(
+            (b for b in self._backends if _eff_cd(b) > now_m), key=_eff_cd
+        )
+        last_exc: BaseException | None = None
+        for idx, backend in enumerate(ordered):
+            try:
+                resp = await backend["client"].aio.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                if float(backend.get("cooldown_until") or 0.0) > 0.0:
+                    backend["cooldown_until"] = 0.0
+                mdl_cds = backend.get("model_cooldowns")
+                if isinstance(mdl_cds, dict) and mdl_cds.get(model):
+                    mdl_cds.pop(model, None)
+                (backend.get("model_strikes") or {}).pop(model, None)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                should_fo, base_cd, safe_sum = _classify_failover_cooldown(exc)
+                if not should_fo or idx + 1 >= len(ordered):
+                    raise
+                strikes = int((backend.get("model_strikes") or {}).get(model) or 0) + 1
+                eff_cd = min(3600.0 if base_cd >= 3600.0 else 1800.0, base_cd * (2 ** min(3, strikes - 1)))
+                for m in coupled:
+                    backend.setdefault("model_strikes", {})[m] = strikes
+                if base_cd >= 3600.0:
+                    backend["cooldown_until"] = time.monotonic() + eff_cd
+                else:
+                    until_ts = time.monotonic() + eff_cd
+                    for m in coupled:
+                        backend.setdefault("model_cooldowns", {})[m] = until_ts
+                logger.warning(
+                    "tsbot hachimi source %s [model=%s] failed (%s); failing over to %s",
+                    backend["label"],
+                    model,
+                    safe_sum,
+                    ordered[idx + 1]["label"],
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No Gemini backend available")
 
     async def _get_pg_pool(self) -> Any:
         if self._pg_pool is not None:
@@ -362,6 +812,25 @@ class HachimiTsBrain:
                 return None
 
     async def close(self) -> None:
+        for task in list(self._bg_tasks):
+            if not task.done():
+                task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+        self._bg_tasks.clear()
+        for backend in list(self._backends):
+            cli = backend.get("client")
+            aio_cli = getattr(cli, "aio", None)
+            close_fn = getattr(aio_cli, "aclose", None) or getattr(aio_cli, "close", None)
+            if callable(close_fn):
+                try:
+                    await close_fn()
+                except Exception:
+                    pass
+        self._backends = []
+        self._genai_client = None
+        self._initial_genai_client = None
+        self._warmup_started = False
         if self._pg_pool is not None:
             try:
                 await self._pg_pool.close()
@@ -1165,6 +1634,7 @@ class HachimiTsBrain:
                 contents=[json.dumps(prompt_data, ensure_ascii=False)],
                 schema_cls=UserTasteSummarySchema,
                 thinking_level="LOW",
+                model=self._lite_model,
             )
             if res and res.taste_summary.strip():
                 pool = await self._get_pg_pool()
@@ -1459,10 +1929,12 @@ class HachimiTsBrain:
         contents: list[Any],
         schema_cls: type[BaseModel],
         thinking_level: str = "LOW",
+        model: str | None = None,
     ) -> Any:
         if not self._ensure_genai():
             return None
         types = self._genai_types
+        target_model = (model or self._model_name).removeprefix("models/")
         clean_schema = _sanitize_schema(schema_cls.model_json_schema())
         cfg_kwargs: dict[str, Any] = {
             "system_instruction": system_instruction,
@@ -1474,8 +1946,8 @@ class HachimiTsBrain:
         if lvl is not None:
             cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=lvl)
         config = types.GenerateContentConfig(**cfg_kwargs)
-        resp = await self._genai_client.aio.models.generate_content(
-            model=self._model_name,
+        resp = await self._generate_with_failover(
+            model=target_model,
             contents=contents,
             config=config,
         )
