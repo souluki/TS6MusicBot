@@ -3,10 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 if [[ -f "$ROOT_DIR/tsbot.env" ]]; then
+  set -a
   # shellcheck disable=SC1090
   source "$ROOT_DIR/tsbot.env"
+  set +a
 fi
 
 HOST="${TSBOT_HOST:-127.0.0.1}"

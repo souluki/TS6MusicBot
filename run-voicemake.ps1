@@ -14,11 +14,15 @@ $ToolPathHints = @{
     CMake = @(
         $env:TSBOT_CMAKE,
         $env:CMAKE,
-        'C:\Cmake\bin\cmake.exe'
+        'C:\Cmake\bin\cmake.exe',
+        'C:\msys64\mingw64\bin\cmake.exe',
+        'C:\msys64\ucrt64\bin\cmake.exe'
     )
     MinGWBin = @(
         $env:TSBOT_MINGW_BIN,
-        'C:\mingw64\bin'
+        'C:\mingw64\bin',
+        'C:\msys64\mingw64\bin',
+        'C:\msys64\ucrt64\bin'
     )
     FFmpeg = @(
         $env:TSBOT_FFMPEG,
