@@ -64,6 +64,8 @@ from .netease import NeteaseClient
 from .netease_cookie import extract_netease_auth_cookie, has_netease_auth_cookie
 from .qqmusic import QQMusicClient
 from .voice_client import VoiceClient, VoiceStatus
+from .hachimi_brain import AffectSnapshot, HachimiTsBrain, TsHachimiPlan
+from .hachimi_tts import speak_hachimi_in_ts, synthesize_hachimi_tts
 from .config import settings
 from .logger import logger
 
@@ -81,6 +83,7 @@ app.add_middleware(
 netease = NeteaseClient()
 qqmusic = QQMusicClient()
 voice = VoiceClient()
+hachimi = HachimiTsBrain()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BILIBILI_AUDIO_DIR = REPO_ROOT / "tmp" / "bilibili_audio"
@@ -357,6 +360,7 @@ async def _startup() -> None:
     try:
         initialize_admin(bootstrap_session)
         initialize_runtime_settings(bootstrap_session)
+        _apply_hachimi_boot_default(bootstrap_session)
     finally:
         bootstrap_session.close()
 
@@ -387,6 +391,7 @@ async def _shutdown() -> None:
         _chat_task.cancel()
         _chat_task = None
     await close_all_bilibili_qr_sessions()
+    await hachimi.close()
     await voice.close()
 
 
@@ -3985,6 +3990,8 @@ _BUILTIN_COMMAND_NAMES = {
     "来一首", "放", "vol", "volume", "音量", "声音", "now", "np", "status", "状态", "当前", "queue", "q",
     "队列", "列表", "pause", "暂停", "resume", "continue", "恢复", "继续", "stop", "停止", "skip", "next",
     "跳过", "下一首", "切歌", "歌词", "lyrics", "desc", "简介", "签名", "fx", "音效",
+    "like", "收藏", "收藏歌曲", "myplaylist", "我的歌单", "个人歌单", "playmine", "播歌单",
+    "播放歌单", "播放我的歌单", "unlike", "删歌单", "taste", "歌品", "我的歌品", "绑定歌单",
 }
 
 
@@ -4193,6 +4200,14 @@ async def _handle_user_joined(event: object) -> None:
 
     row = _find_welcome_voice()
     if row is None:
+        if _runtime_bool("hachimi.enabled") and _runtime_bool("hachimi.welcome_enabled"):
+            unique_id = str(getattr(event, "unique_id", "") or "").strip()
+            if not _welcome_cooldown_allows(unique_id or str(getattr(event, "client_id", "") or "")):
+                logger.info("hachimi welcome skipped: cooldown user=%s", unique_id or "anonymous")
+                return
+            user_name = str(getattr(event, "name", "") or "新朋友")
+            await _handle_hachimi_welcome(user_name=user_name, unique_id=unique_id)
+            return
         logger.info("welcome voice skipped: no global welcome audio configured")
         return
 
@@ -4480,6 +4495,7 @@ async def _handle_chat_command(
     *,
     target_mode: int = 2,
     invoker_unique_id: str = "",
+    _from_hachimi: bool = False,
 ) -> None:
     raw = (message or "")
     msg = raw.strip()
@@ -4594,11 +4610,41 @@ async def _handle_chat_command(
         "音效": "fx",
         "lyrics": "lyrics",
         "歌词": "lyrics",
+        "hachimi": "hachimi_mode",
+        "哈基咪模式": "hachimi_mode",
+        "like": "like_song",
+        "like_current": "like_song",
+        "save_song": "like_song",
+        "收藏": "like_song",
+        "收藏歌曲": "like_song",
+        "myplaylist": "my_playlist",
+        "我的歌单": "my_playlist",
+        "个人歌单": "my_playlist",
+        "playmine": "play_user_playlist",
+        "play_user_playlist": "play_user_playlist",
+        "播歌单": "play_user_playlist",
+        "播放歌单": "play_user_playlist",
+        "播放我的歌单": "play_user_playlist",
+        "unlike": "remove_playlist_song",
+        "remove_song": "remove_playlist_song",
+        "删歌单": "remove_playlist_song",
+        "bind_netease_playlist": "bind_netease_playlist",
+        "绑定歌单": "bind_netease_playlist",
+        "taste": "music_taste",
+        "歌品": "music_taste",
+        "我的歌品": "music_taste",
     }
 
     cmd = alias_to_cmd.get(head_norm)
     if not cmd:
         if _find_custom_voice(head_norm) is None:
+            if not _from_hachimi and _runtime_bool("hachimi.enabled"):
+                await _handle_hachimi_chat(
+                    invoker_name=invoker_name,
+                    message=msg,
+                    target_mode=target_mode,
+                    invoker_unique_id=invoker_unique_id,
+                )
             return
         cmd = "custom_voice"
     arg = tail.strip()
@@ -4624,6 +4670,59 @@ async def _handle_chat_command(
 
         if cmd in ("help", "h"):
             await reply(_format_help())
+            return
+
+        if cmd == "hachimi_mode":
+            is_owner = hachimi._is_owner_ts_identity(
+                invoker_name,
+                invoker_unique_id,
+                owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+                owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+            )
+            if not is_owner:
+                await reply("只有老咪可以切换哈基咪大脑模式")
+                return
+            action = arg.strip().lower()
+            if action in {"on", "1", "true", "开启", "开", "接入", "启动"}:
+                session = new_session()
+                try:
+                    update_settings(session, {"hachimi.enabled": True}, apply=True)
+                finally:
+                    session.close()
+                await reply("已切换为【哈基咪大脑】陪玩模式（共享记忆与情绪 + 语音/文字互动已开启）")
+                return
+            if action in {"off", "0", "false", "关闭", "关", "普通", "退出"}:
+                session = new_session()
+                try:
+                    update_settings(session, {"hachimi.enabled": False}, apply=True)
+                finally:
+                    session.close()
+                await hachimi.close()
+                await reply("已切换回【普通 TS6 音乐机器人】模式（哈基咪大脑已待机）")
+                return
+            cur_mode = "哈基咪大脑陪玩模式" if _runtime_bool("hachimi.enabled") else "普通 TS6 音乐机器人模式"
+            await reply(f"当前运行模式：{cur_mode}\n用法：哈基咪模式 开启 / 哈基咪模式 关闭")
+            return
+
+        if cmd in {"like_song", "my_playlist", "play_user_playlist", "remove_playlist_song", "bind_netease_playlist", "music_taste"}:
+            action_map = {
+                "like_song": "save_song" if arg else "like_current",
+                "my_playlist": "get_user_music",
+                "music_taste": "get_user_music",
+                "play_user_playlist": "play_user_playlist",
+                "remove_playlist_song": "remove_song",
+                "bind_netease_playlist": "bind_netease_playlist",
+            }
+            act_res = await _execute_user_music_action(
+                action=action_map[cmd],
+                query=arg,
+                speaker_name=invoker_name,
+                ts_unique_id=invoker_unique_id,
+                qq_sender_id="",
+                source="ts6",
+            )
+            if not _from_hachimi and act_res.get("status_text"):
+                await reply(str(act_res["status_text"]))
             return
 
         if cmd == "lyrics":
@@ -5027,6 +5126,19 @@ async def _handle_chat_command(
                 requested_by=invoker_name,
                 quality_level="auto",
             )
+            try:
+                await hachimi.record_user_music_play(
+                    track_id=f"netease:{song_id}",
+                    title=title,
+                    artist=artist,
+                    speaker_name=invoker_name,
+                    ts_unique_id=invoker_unique_id,
+                    source="ts6",
+                    owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+                    owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+                )
+            except Exception:
+                pass
             song_label = f"{title} - {artist}".strip(" -")
             extra = ""
             if trial:
@@ -5091,6 +5203,181 @@ async def _handle_voice_log_event(message: str) -> None:
     await _refresh_ts_profile_from_current()
 
 
+async def _music_status_summary() -> str:
+    try:
+        st = await voice.get_status()
+        title = (st.now_playing_title or "").strip() or "空闲未播放"
+        state = str(st.state or "STATE_IDLE")
+        vol = int(st.volume_percent or 100)
+    except Exception:
+        title, state, vol = "未知", "UNKNOWN", 100
+    session = new_session()
+    try:
+        q_total = int(session.execute(select(func.count(QueueItem.id))).scalar() or 0)
+    except Exception:
+        q_total = 0
+    finally:
+        session.close()
+    return f"当前曲目={title} | 状态={state} | 音量={vol}% | 队列剩余={q_total}首"
+
+
+async def _deliver_hachimi_speech_and_action(
+    *,
+    plan: TsHachimiPlan,
+    affect: AffectSnapshot,
+    invoker_name: str,
+    invoker_unique_id: str,
+    target_mode: int,
+    send_chat_text: bool,
+) -> None:
+    if plan.music_cmd != "none":
+        synthetic_cmd = f"{plan.music_cmd} {plan.music_arg}".strip()
+        try:
+            await _handle_chat_command(
+                invoker_name,
+                synthetic_cmd,
+                target_mode=target_mode,
+                invoker_unique_id=invoker_unique_id,
+                _from_hachimi=True,
+            )
+            if plan.music_cmd in {"play", "add", "skip"} and plan.spoken_reply:
+                await asyncio.sleep(0.25)
+        except Exception:
+            logger.exception("hachimi music command execution failed: %s", synthetic_cmd)
+
+    if send_chat_text and plan.chat_reply:
+        try:
+            text_out = plan.chat_reply.strip()
+            if len(text_out) > 650:
+                text_out = text_out[:650] + "..."
+            await voice.send_notice(text_out, target_mode=int(target_mode))
+        except Exception:
+            logger.warning("failed to send hachimi chat notice")
+
+    if plan.spoken_reply and _runtime_bool("hachimi.tts_enabled"):
+        try:
+            audio_path = await synthesize_hachimi_tts(
+                plan.spoken_reply,
+                mood=affect.mood,
+                irritation=affect.irritation,
+                circadian=affect.circadian,
+            )
+            if audio_path is not None:
+                voice_vol = _runtime_int("voice.custom_voice_volume", 150)
+                await speak_hachimi_in_ts(
+                    voice,
+                    audio_path,
+                    title="哈基咪",
+                    requested_by=invoker_name or "哈基咪",
+                    voice_volume_percent=voice_vol,
+                    duck_db=12.0,
+                )
+        except Exception:
+            logger.exception("hachimi tts synthesis/playback failed")
+
+
+async def _handle_hachimi_chat(
+    *,
+    invoker_name: str,
+    message: str,
+    target_mode: int,
+    invoker_unique_id: str,
+) -> None:
+    try:
+        music_summary = await _music_status_summary()
+        plan, affect = await hachimi.plan_ts_chat(
+            speaker_name=invoker_name,
+            ts_unique_id=invoker_unique_id,
+            message=message,
+            target_mode=target_mode,
+            music_summary=music_summary,
+            owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+            owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+        )
+        if plan is None or not plan.should_reply:
+            return
+        await _deliver_hachimi_speech_and_action(
+            plan=plan,
+            affect=affect,
+            invoker_name=invoker_name,
+            invoker_unique_id=invoker_unique_id,
+            target_mode=target_mode,
+            send_chat_text=True,
+        )
+    except Exception:
+        logger.exception("hachimi chat handling failed")
+
+
+async def _handle_hachimi_utterance(utt: object) -> None:
+    if not (_runtime_bool("hachimi.enabled") and _runtime_bool("hachimi.voice_listen_enabled")):
+        return
+    wav_raw = str(getattr(utt, "wav_path", "") or "").strip()
+    if not wav_raw:
+        return
+    wav_path = Path(wav_raw)
+    speaker_name = str(getattr(utt, "speaker_name", "") or "队友")
+    unique_id = str(getattr(utt, "unique_id", "") or "")
+    duration_ms = int(getattr(utt, "duration_ms", 0) or 0)
+    try:
+        music_summary = await _music_status_summary()
+        plan, affect = await hachimi.plan_ts_utterance(
+            wav_path=wav_path,
+            speaker_name=speaker_name,
+            ts_unique_id=unique_id,
+            duration_ms=duration_ms,
+            music_summary=music_summary,
+            owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+            owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+        )
+        if plan is None or not plan.should_reply:
+            return
+        await _deliver_hachimi_speech_and_action(
+            plan=plan,
+            affect=affect,
+            invoker_name=speaker_name,
+            invoker_unique_id=unique_id,
+            target_mode=2,
+            send_chat_text=bool(plan.chat_reply),
+        )
+    except Exception:
+        logger.exception("hachimi voice utterance handling failed")
+
+
+async def _handle_hachimi_welcome(*, user_name: str, unique_id: str) -> None:
+    try:
+        music_summary = await _music_status_summary()
+        plan, affect = await hachimi.plan_ts_welcome(
+            speaker_name=user_name,
+            ts_unique_id=unique_id,
+            music_summary=music_summary,
+            owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+            owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+        )
+        if plan is None:
+            return
+        if plan.chat_reply:
+            await voice.send_notice(plan.chat_reply[:300], target_mode=2)
+        if plan.spoken_reply and _runtime_bool("hachimi.tts_enabled"):
+            audio_path = await synthesize_hachimi_tts(
+                plan.spoken_reply,
+                mood=affect.mood,
+                irritation=affect.irritation,
+                circadian=affect.circadian,
+            )
+            if audio_path is not None:
+                voice_vol = _runtime_int("voice.custom_voice_volume", 150)
+                await speak_hachimi_in_ts(
+                    voice,
+                    audio_path,
+                    title=f"欢迎 {user_name}",
+                    requested_by="哈基咪",
+                    voice_volume_percent=voice_vol,
+                    duck_db=12.0,
+                )
+    except Exception:
+        logger.exception("hachimi welcome failed")
+
+
 async def _chat_command_worker() -> None:
     retry_delay = 1.0
     while True:
@@ -5100,6 +5387,7 @@ async def _chat_command_worker() -> None:
                 include_playback=True,
                 include_log=True,
                 include_user_joined=True,
+                include_utterance=True,
             ):
                 retry_delay = 1.0
                 try:
@@ -5151,6 +5439,10 @@ async def _chat_command_worker() -> None:
 
                     if kind == "user_joined":
                         await _handle_user_joined(ev.user_joined)
+                        continue
+
+                    if kind == "utterance":
+                        asyncio.create_task(_handle_hachimi_utterance(ev.utterance))
                         continue
 
                     if kind == "log":
@@ -6919,3 +7211,512 @@ async def qqmusic_refresh_login() -> dict:
         return await qqmusic.refresh_login()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class HachimiModeRequest(BaseModel):
+    enabled: bool
+
+
+def _apply_hachimi_boot_default(session: Session) -> None:
+    boot_mode = os.getenv("TSBOT_HACHIMI_BOOT_DEFAULT", "").strip().lower()
+    if boot_mode in {"0", "false", "off", "normal"}:
+        update_settings(session, {"hachimi.enabled": False}, apply=True)
+    elif boot_mode in {"1", "true", "on", "hachimi"}:
+        update_settings(session, {"hachimi.enabled": True}, apply=True)
+
+
+def _is_local_or_admin(request: Request, session: Session) -> bool:
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host in {"127.0.0.1", "::1", "localhost"}:
+        return True
+    try:
+        require_admin(request, session)
+        return True
+    except HTTPException:
+        return False
+
+
+@app.get("/hachimi/status")
+async def hachimi_status() -> dict:
+    """查询哈基咪在 TS6 侧的实时情绪、状态与记忆池连接情况"""
+    enabled = _runtime_bool("hachimi.enabled")
+    if not enabled:
+        return {
+            "enabled": False,
+            "mode": "normal_ts6_bot",
+            "voice_listen_enabled": _runtime_bool("hachimi.voice_listen_enabled"),
+            "tts_enabled": _runtime_bool("hachimi.tts_enabled"),
+            "welcome_enabled": _runtime_bool("hachimi.welcome_enabled"),
+            "pg_connected": False,
+            "mood": 0.0,
+            "irritation": 0.0,
+            "mood_reason": "",
+            "energy_state": "",
+            "directives_count": 0,
+        }
+    speaker_ctx, affect = await hachimi.resolve_speaker_and_state(
+        speaker_name="老咪",
+        ts_unique_id="",
+        query_text="",
+        owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+        owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+    )
+    return {
+        "enabled": True,
+        "mode": "hachimi_brain",
+        "voice_listen_enabled": _runtime_bool("hachimi.voice_listen_enabled"),
+        "tts_enabled": _runtime_bool("hachimi.tts_enabled"),
+        "welcome_enabled": _runtime_bool("hachimi.welcome_enabled"),
+        "pg_connected": hachimi._pg_pool is not None,
+        "mood": affect.mood,
+        "irritation": affect.irritation,
+        "mood_reason": affect.mood_reason,
+        "energy_state": affect.circadian,
+        "directives_count": len(speaker_ctx.get("owner_directives") or []),
+    }
+
+
+@app.post("/hachimi/mode")
+async def set_hachimi_mode(
+    req: HachimiModeRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """本机一键启动器或管理员热切换：普通 TS6 BOT <-> 哈基咪大脑模式"""
+    if not _is_local_or_admin(request, session):
+        raise HTTPException(status_code=403, detail="仅限本机控制台或管理员切换模式")
+    update_settings(session, {"hachimi.enabled": bool(req.enabled)}, apply=True)
+    if not req.enabled:
+        await hachimi.close()
+    status = await hachimi_status()
+    return {"ok": True, **status}
+
+
+class HachimiMusicBridgeRequest(BaseModel):
+    action: str
+    query: str = ""
+    qq_sender_id: str = ""
+    sender_name: str = ""
+    announce_in_ts: bool = True
+
+
+async def _get_current_playing_track_info() -> tuple[str, str, str] | None:
+    item_id: int | None = None
+    async with _playback_lock:
+        item_id = _current_queue_item_id or _pending_queue_item_id
+    session = new_session()
+    try:
+        if item_id is not None:
+            q_row = session.get(QueueItem, int(item_id))
+            if q_row and q_row.track_id and q_row.title:
+                return str(q_row.track_id), str(q_row.title), str(q_row.artist or "")
+        st = await voice.get_status()
+        state = str(getattr(st, "state", "") or "").strip().upper()
+        if state in {"STATE_PLAYING", "STATE_PAUSED"}:
+            hist = session.execute(select(HistoryItem).order_by(HistoryItem.id.desc()).limit(1)).scalars().first()
+            if hist and hist.track_id and hist.title:
+                return str(hist.track_id), str(hist.title), str(hist.artist or "")
+    except Exception:
+        pass
+    finally:
+        session.close()
+    return None
+
+
+async def _resolve_netease_query_to_song(query: str) -> tuple[str, str, str] | None:
+    q = (query or "").strip()
+    if not q:
+        return None
+    song_id = _try_parse_song_id(q)
+    if song_id is None:
+        raw = await netease.search(keywords=q, limit=1)
+        return _extract_song_meta_from_search_first(raw)
+    session = new_session()
+    try:
+        cookie = _get_admin_cookie(session)
+    except Exception:
+        cookie = None
+    finally:
+        session.close()
+    detail = await netease.song_detail(song_id=song_id, cookie=cookie)
+    meta2 = _extract_song_meta_from_detail(detail, song_id)
+    if meta2 is not None:
+        return song_id, meta2[0], meta2[1]
+    return song_id, song_id, ""
+
+
+async def _execute_user_music_action(
+    *,
+    action: str,
+    query: str = "",
+    speaker_name: str = "",
+    ts_unique_id: str = "",
+    qq_sender_id: str = "",
+    source: str = "ts6",
+) -> dict:
+    owner_names = _runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi")
+    owner_uids = _runtime_string("hachimi.owner_ts_uids", "")
+    act = (action or "").strip().lower()
+    q = (query or "").strip()
+
+    if act == "like_current":
+        cur = await _get_current_playing_track_info()
+        if cur is None:
+            return {"ok": False, "status_text": "当前 TS 没有正在播放的歌曲，无法收藏"}
+        track_id, title, artist = cur
+        saved = await hachimi.save_to_user_playlist(
+            track_id=track_id,
+            title=title,
+            artist=artist,
+            speaker_name=speaker_name,
+            ts_unique_id=ts_unique_id,
+            qq_sender_id=qq_sender_id,
+            owner_ts_names=owner_names,
+            owner_ts_uids=owner_uids,
+        )
+        if not saved.get("ok"):
+            return {"ok": False, "status_text": "收藏失败：记忆数据库暂不可用"}
+        label = f"{title} - {artist}".strip(" -")
+        return {
+            "ok": True,
+            "status_text": f"已将《{label}》收藏进 {saved['display_name']} 的个人歌单（共 {saved['total_saved']} 首）",
+            "track": {"track_id": track_id, "title": title, "artist": artist},
+        }
+
+    if act == "save_song":
+        if not q:
+            return await _execute_user_music_action(
+                action="like_current",
+                speaker_name=speaker_name,
+                ts_unique_id=ts_unique_id,
+                qq_sender_id=qq_sender_id,
+                source=source,
+            )
+        pl_id = _try_parse_netease_playlist_id(q.split()[0])
+        if pl_id and ("music.163.com" in q or len(pl_id) >= 8 and "playlist" in q.lower()):
+            return await _execute_user_music_action(
+                action="bind_netease_playlist",
+                query=q,
+                speaker_name=speaker_name,
+                ts_unique_id=ts_unique_id,
+                qq_sender_id=qq_sender_id,
+                source=source,
+            )
+        meta = await _resolve_netease_query_to_song(q)
+        if meta is None:
+            return {"ok": False, "status_text": f"未找到歌曲：{q}"}
+        song_id, title, artist = meta
+        saved = await hachimi.save_to_user_playlist(
+            track_id=f"netease:{song_id}",
+            title=title,
+            artist=artist,
+            speaker_name=speaker_name,
+            ts_unique_id=ts_unique_id,
+            qq_sender_id=qq_sender_id,
+            owner_ts_names=owner_names,
+            owner_ts_uids=owner_uids,
+        )
+        if not saved.get("ok"):
+            return {"ok": False, "status_text": "收藏失败：记忆数据库暂不可用"}
+        label = f"{title} - {artist}".strip(" -")
+        return {
+            "ok": True,
+            "status_text": f"已将《{label}》加入 {saved['display_name']} 的个人歌单（共 {saved['total_saved']} 首）",
+            "track": {"track_id": f"netease:{song_id}", "title": title, "artist": artist},
+        }
+
+    if act == "remove_song":
+        if not q:
+            return {"ok": False, "status_text": "请提供要从个人歌单删除的歌名关键词"}
+        res = await hachimi.remove_from_user_playlist(
+            keyword=q,
+            speaker_name=speaker_name,
+            ts_unique_id=ts_unique_id,
+            qq_sender_id=qq_sender_id,
+            owner_ts_names=owner_names,
+            owner_ts_uids=owner_uids,
+        )
+        if not res.get("removed"):
+            return {"ok": False, "status_text": f"个人歌单里没找到包含「{q}」的曲目"}
+        return {
+            "ok": True,
+            "status_text": f"已从个人歌单移除 {res['removed']} 首：{'、'.join(res.get('titles') or [])}",
+        }
+
+    if act == "bind_netease_playlist":
+        pl_id = _try_parse_netease_playlist_id(q.split()[0] if q else "")
+        if not pl_id:
+            return {"ok": False, "status_text": "请提供有效的网易云歌单数字 ID 或链接"}
+        cookie = _get_admin_cookie_or_none()
+        detail = await netease.playlist_detail(playlist_id=pl_id, cookie=cookie)
+        playlist_name, tracks = await _load_netease_playlist_tracks(detail, cookie=cookie)
+        if not tracks:
+            return {"ok": False, "status_text": "该网易云歌单为空或暂不可读"}
+        saved_count = 0
+        disp_out = speaker_name or "用户"
+        for track in tracks[:50]:
+            norm = _normalize_netease_song(track)
+            if norm is None:
+                continue
+            sv = await hachimi.save_to_user_playlist(
+                track_id=f"netease:{norm['song_id']}",
+                title=str(norm["title"]),
+                artist=str(norm["artist"]),
+                playlist_name=playlist_name or "导入歌单",
+                speaker_name=speaker_name,
+                ts_unique_id=ts_unique_id,
+                qq_sender_id=qq_sender_id,
+                owner_ts_names=owner_names,
+                owner_ts_uids=owner_uids,
+            )
+            if sv.get("ok"):
+                saved_count += 1
+                disp_out = str(sv.get("display_name") or disp_out)
+        return {
+            "ok": saved_count > 0,
+            "status_text": f"已把网易云歌单《{playlist_name or pl_id}》前 {saved_count} 首歌存入 {disp_out} 的专属歌单",
+        }
+
+    if act == "play_user_playlist":
+        mp = await hachimi.get_user_music_profile(
+            target_name=q,
+            speaker_name=speaker_name,
+            ts_unique_id=ts_unique_id,
+            qq_sender_id=qq_sender_id,
+            owner_ts_names=owner_names,
+            owner_ts_uids=owner_uids,
+        )
+        candidates = list(mp.get("saved_playlist") or [])
+        from_history = False
+        if not candidates:
+            candidates = list(mp.get("favorite_tracks") or [])
+            from_history = True
+        if not candidates:
+            who = mp.get("display_name") or q or speaker_name or "你"
+            return {"ok": False, "status_text": f"还没存过 {who} 的个人歌单或点歌记录呢，先点几首或收藏几首吧"}
+
+        req_by = f"{speaker_name or mp.get('display_name') or '歌单'}({source})"
+        added = 0
+        first_played_label = ""
+        st_state = "STATE_IDLE"
+        try:
+            st = await voice.get_status()
+            st_state = str(getattr(st, "state", "") or "STATE_IDLE").strip().upper()
+        except Exception:
+            st_state = "STATE_IDLE"
+
+        for idx, tr in enumerate(candidates[:20]):
+            tid = str(tr.get("track_id") or "")
+            title = str(tr.get("title") or "")
+            artist = str(tr.get("artist") or "")
+            if tid.startswith("netease:"):
+                sid = tid.split(":", 1)[1]
+                play_immediately = (idx == 0 and st_state == "STATE_IDLE")
+                try:
+                    await _enqueue_netease_song(
+                        song_id=sid,
+                        title=title,
+                        artist=artist,
+                        play_now=play_immediately,
+                        requested_by=req_by,
+                        quality_level="auto",
+                    )
+                    added += 1
+                    if not first_played_label:
+                        first_played_label = f"{title} - {artist}".strip(" -")
+                except Exception:
+                    continue
+        if added == 0:
+            return {"ok": False, "status_text": "歌单里的曲目暂时无法获取播放源"}
+        kind_label = "常听偏好曲目" if from_history else "个人歌单"
+        who = mp.get("display_name") or q or speaker_name or "用户"
+        return {
+            "ok": True,
+            "status_text": f"已加载 {who} 的{kind_label}共 {added} 首进入 TS 播放队列（首曲：{first_played_label}）",
+            "added_count": added,
+        }
+
+    # Default: get_user_music
+    mp = await hachimi.get_user_music_profile(
+        target_name=q,
+        speaker_name=speaker_name,
+        ts_unique_id=ts_unique_id,
+        qq_sender_id=qq_sender_id,
+        owner_ts_names=owner_names,
+        owner_ts_uids=owner_uids,
+    )
+    who = mp.get("display_name") or q or speaker_name or "用户"
+    saved = mp.get("saved_playlist") or []
+    favs = mp.get("favorite_tracks") or []
+    taste = mp.get("taste_summary") or "暂无足够点歌记录"
+    lines = [f"【{who} 的歌品与歌单】（累计点歌 {mp.get('total_plays', 0)} 次）", f"歌品画像：{taste}"]
+    if favs:
+        fav_str = "、".join(f"{t['title']}({t.get('plays', 1)}次)" for t in favs[:5])
+        lines.append(f"常点曲目：{fav_str}")
+    if saved:
+        sv_str = "、".join(f"{t['title']}-{t.get('artist', '')}".strip("-") for t in saved[:8])
+        lines.append(f"收藏歌单（共{len(saved)}首）：{sv_str}")
+    else:
+        lines.append("收藏歌单：暂未手动收藏（可用 !收藏 或对哈基咪说「把这首歌加进我的歌单」）")
+    return {"ok": True, "status_text": "\n".join(lines), "music_profile": mp}
+
+
+@app.get("/hachimi/music/status")
+async def hachimi_music_status(
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """供本机 QQ 哈基咪快速探活并读取当前 TS 播放状态"""
+    if not _is_local_or_admin(request, session):
+        raise HTTPException(status_code=403, detail="仅限本机或管理员访问")
+    try:
+        st = await voice.get_status()
+        ts_connected = bool(getattr(st, "ts_connected", False))
+        state = str(getattr(st, "state", "") or "STATE_IDLE")
+        now_playing = str(getattr(st, "now_playing_title", "") or "").strip()
+        vol = int(getattr(st, "volume_percent", 100) or 100)
+        voice_online = True
+    except Exception:
+        ts_connected = False
+        state = "OFFLINE"
+        now_playing = ""
+        vol = 100
+        voice_online = False
+    q_total = int(session.execute(select(func.count(QueueItem.id))).scalar() or 0)
+    return {
+        "ok": True,
+        "voice_online": voice_online,
+        "ts_connected": ts_connected,
+        "state": state,
+        "now_playing": now_playing,
+        "volume_percent": vol,
+        "queue_length": q_total,
+    }
+
+
+@app.post("/hachimi/music/bridge")
+async def hachimi_music_bridge(
+    req: HachimiMusicBridgeRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """QQ -> TS6 跨端音乐控制与个人歌单/歌品操作桥接接口"""
+    if not _is_local_or_admin(request, session):
+        raise HTTPException(status_code=403, detail="仅限本机或管理员访问")
+
+    act = (req.action or "").strip().lower()
+    query = (req.query or "").strip()
+    caller_label = (req.sender_name or req.qq_sender_id or "QQ用户").strip()[:24]
+    req_by = f"QQ:{caller_label}"
+
+    # Personal playlist & music taste operations work even if TS voice-service is temporarily idle
+    if act in {"like_current", "save_song", "remove_song", "play_user_playlist", "bind_netease_playlist", "get_user_music"}:
+        res = await _execute_user_music_action(
+            action=act,
+            query=query,
+            speaker_name=caller_label,
+            qq_sender_id=req.qq_sender_id,
+            source="qq",
+        )
+        if req.announce_in_ts and res.get("ok") and act == "play_user_playlist":
+            try:
+                await voice.send_notice(f"[QQ点歌 · {caller_label}] {res.get('status_text', '')}", target_mode=2)
+            except Exception:
+                pass
+        return res
+
+    if act in {"play", "add"}:
+        if not query:
+            return {"ok": False, "status_text": "未指定要播放的歌曲名"}
+        pl_id = _try_parse_netease_playlist_id(query.split()[0])
+        if pl_id and ("music.163.com" in query or "playlist" in query.lower()):
+            pl_name, added, failed, auto_started = await _enqueue_netease_playlist(pl_id, requested_by=req_by)
+            if not added:
+                return {"ok": False, "status_text": "歌单为空或无法加载曲目"}
+            msg = f"已从网易云歌单《{pl_name}》加入 {added} 首歌到 TS" + ("并开始播放" if auto_started else "")
+            if req.announce_in_ts:
+                try:
+                    await voice.send_notice(f"[QQ点歌 · {caller_label}] {msg}", target_mode=2)
+                except Exception:
+                    pass
+            return {"ok": True, "status_text": msg}
+
+        meta = await _resolve_netease_query_to_song(query)
+        if meta is None:
+            return {"ok": False, "status_text": f"在曲库里没搜到「{query}」"}
+        song_id, title, artist = meta
+        try:
+            item_id, trial = await _enqueue_netease_song(
+                song_id=song_id,
+                title=title,
+                artist=artist,
+                play_now=(act == "play"),
+                requested_by=req_by,
+                quality_level="auto",
+            )
+        except HTTPException as exc:
+            return {"ok": False, "status_text": f"歌曲《{title}》加载失败（{exc.detail}）"}
+        except Exception as exc:
+            return {"ok": False, "status_text": f"TS 语音服务未就绪或播放失败：{exc}"}
+
+        auto_started = False
+        if act == "add":
+            try:
+                st = await voice.get_status()
+                if str(getattr(st, "state", "") or "").strip().upper() == "STATE_IDLE":
+                    await _auto_play_next_from_queue()
+                    auto_started = True
+            except Exception:
+                pass
+
+        try:
+            await hachimi.record_user_music_play(
+                track_id=f"netease:{song_id}",
+                title=title,
+                artist=artist,
+                speaker_name=caller_label,
+                qq_sender_id=req.qq_sender_id,
+                source="qq",
+                owner_ts_names=_runtime_string("hachimi.owner_ts_names", "线性流逝,老咪,蕾咪,Remi"),
+                owner_ts_uids=_runtime_string("hachimi.owner_ts_uids", ""),
+            )
+        except Exception:
+            pass
+
+        song_label = f"{title} - {artist}".strip(" -")
+        trial_tag = "（试听版）" if trial else ""
+        if act == "play":
+            status_text = f"已在 TS 立即播放：《{song_label}》{trial_tag}"
+        elif auto_started:
+            status_text = f"已加入 TS 队列并开始播放：《{song_label}》{trial_tag}"
+        else:
+            status_text = f"已加入 TS 播放队列（#{item_id}）：《{song_label}》{trial_tag}"
+
+        if req.announce_in_ts:
+            try:
+                await voice.send_notice(f"[QQ点歌 · {caller_label}] {status_text}", target_mode=2)
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "status_text": status_text,
+            "track": {"track_id": f"netease:{song_id}", "title": title, "artist": artist},
+        }
+
+    # Playback controls: skip, pause, resume, stop, vol, clear, random, order, repeat, now, queue
+    if act in {"skip", "pause", "resume", "stop", "vol", "clear", "random", "order", "repeat", "now", "queue"}:
+        if act in {"now", "queue"}:
+            summary = await _music_status_summary()
+            return {"ok": True, "status_text": summary}
+        synthetic = f"{act} {query}".strip()
+        await _handle_chat_command(
+            req_by,
+            synthetic,
+            target_mode=2,
+            invoker_unique_id="",
+            _from_hachimi=True,
+        )
+        summary = await _music_status_summary()
+        return {"ok": True, "status_text": f"已在 TS 执行 {synthetic}（{summary}）"}
+
+    return {"ok": False, "status_text": f"不支持的音乐指令：{act}"}

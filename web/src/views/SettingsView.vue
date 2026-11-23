@@ -66,6 +66,7 @@ const GROUPS = [
   ['music', '音乐接口配置'],
   ['authorization', '音乐会员登录'],
   ['teamspeak', 'TeamSpeak 配置'],
+  ['hachimi', '哈基咪陪玩'],
   ['serverquery', 'ServerQuery 兼容'],
   ['access', '外部 api'],
 ] as const
